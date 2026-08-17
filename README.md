@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🦊 Fennek
+# 🦊 JARVIS
 
 **An alternative open-source firmware for the LilyGO T-Deck Pro**
 
