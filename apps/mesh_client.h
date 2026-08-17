@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dr. Daniel Dumke
+
+// =============================================================================
+// mesh_client.h — schlanker MeshCore-Client (Channels, DMs, Kontakte).
+//
+// Nutzt den vendored MeshCore-Stack (lib/meshcore) über BaseChatMesh — nach
+// dem Vorbild von archive_legacy/examples/simple_secure_chat. Kein BLE-
+// Companion. Persistenz auf SPIFFS (interner Flash, keine SPI-Bus-Konkurrenz):
+// /identity, /contacts, /node_prefs.
+//
+// Threading: ALLE Aufrufe laufen im UI-Thread (Core 1); jeder Radio-Zugriff
+// (SX1262 am geteilten HSPI) wird intern mit spiLock()/spiUnlock() gekapselt.
+// =============================================================================
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+namespace mesh_client {
+
+// Eine Nachricht im Verlaufs-Ringpuffer.
+struct MsgView {
+  uint8_t  kind;          // 0=Channel, 1=DM eingehend, 2=DM ausgehend
+  uint8_t  ackState;      // nur kind=2: 0=-, 1=ausstehend, 2=zugestellt, 3=Timeout
+  char     from[32];      // Absendername ("" bei Channel — steckt im Text)
+  char     text[160];     // UTF-8
+  uint32_t timestamp;
+  uint8_t  contactIdx;    // nur DM: Index in der Kontaktliste (0xFF = unbekannt)
+  uint8_t  channelIdx;    // nur kind=0: Kanal-Index (0=Public). Trennt die Chats.
+};
+
+// Radio + Identity + Kontakte initialisieren. false = Radio nicht gefunden.
+bool begin();
+bool ready();
+
+// Mesh-Pumpe: jeden Loop-Durchlauf aufrufen (nimmt spiLock selbst).
+void loop();
+
+// Pumpe pausieren (z. B. während WiFi-Dateitransfers den SPI-Bus brauchen).
+// Wirkt sofort; das Radio bleibt initialisiert. No-op solange nicht ready.
+void setSuspended(bool sus);
+
+// --- Nachrichten ---------------------------------------------------------------
+int  msgCount();
+bool msg(int i, MsgView& out);          // i=0 = älteste im Puffer
+uint32_t changeCounter();               // erhöht sich bei jeder Änderung
+
+// --- Senden ----------------------------------------------------------------------
+bool sendChannelMsg(const char* text);  // an den Public-Channel
+bool sendChannelIdxMsg(int channelIdx, const char* text);  // an Kanal nach Index
+bool sendDirectMsg(int contactIdx, const char* text);
+// Letzte fehlgeschlagene DM (ackState==3 Timeout) an diesen Kontakt erneut senden.
+// false, wenn keine fehlgeschlagene DM existiert. Setzt ackState wieder auf "ausstehend".
+bool resendDirect(int contactIdx);
+void sendAdvert();                      // Zero-Hop-Advert ("ich bin hier")
+void sendAdvertFlood();                 // Flood-Advert (mehrhopfähig, erreicht entfernte Nodes)
+
+// --- Hashtag-Channels (Mesh-Rheinland-Konvention) ---------------------------------
+// PSK = sha256("#<name>")[:16] — öffentlich bekannter Schlüssel aus dem Namen.
+// join: dem Kanal beitreten (idempotent); liefert Kanal-Index oder -1.
+int  joinHashChannel(const char* name);            // name mit oder ohne '#'
+bool sendHashChannelMsg(const char* name, const char* text);   // joint bei Bedarf
+int  channelCount();
+bool channelName(int i, char* out, size_t n);
+
+// --- Kontakte ---------------------------------------------------------------------
+int  contactCount();
+bool contactName(int i, char* out, size_t n);
+// Detail eines Kontakts: hops = Hop-Anzahl des bekannten Pfads (0xFF = unbekannt,
+// Flood), lastSeen = Advert-Zeitstempel (Unix-Epoche), type = ADV_TYPE_*.
+// Beliebige Out-Pointer dürfen NULL sein. false, wenn Index ungültig/nicht ready.
+bool contactDetail(int i, uint8_t* hops, uint32_t* lastSeen, uint8_t* type);
+// Position eines Kontakts (Dezimalgrad) aus dessen letztem Advert. false, wenn
+// keine Position annonciert (oder Index ungültig/nicht ready).
+bool contactPos(int i, double* lat, double* lon);
+
+// Alle Kontakte löschen + persistente Spiegel (SPIFFS /contacts, SD contacts.bin)
+// entfernen. Neuaufbau erfolgt aus eingehenden Adverts. Konsole: „contacts reset".
+void resetContacts();
+
+const char* nodeName();
+void setNodeName(const char* name);     // persistiert + wirkt ab sofort
+
+// Eigene Node-Position (Dezimalgrad) für Standortbaken im Advert. 0/0 = nicht
+// gesetzt. setNodePosition persistiert in NVS und wirkt ab dem nächsten Advert.
+void nodePos(double* lat, double* lon);
+void setNodePosition(double lat, double lon);
+
+// Funkparameter aus settings::meshParams() live aufs Radio anwenden
+// (Frequenz/BW/SF/CR/Präambel/Sendeleistung). No-op solange nicht ready.
+void applyRadioParams();
+
+// Radio-Statistiken (Noise-Floor dBm, empfangene/gesendete Pakete).
+bool radioStats(int* noiseFloor, uint32_t* rxPkts, uint32_t* txPkts);
+
+// Aktuelle Mesh-Uhrzeit (Unix-Epoche; aus Adverts synchronisiert). 0 solange
+// Mesh nicht initialisiert.
+uint32_t rtcTime();
+
+// Aktuelle Uhrzeit der kanonischen Uhr (ESP32-Systemzeit), auch vor Mesh-Init
+// verfügbar — für den Zeit-Koordinator (services/timesync).
+uint32_t clockNow();
+
+// Uhr von außen setzen (NTP/NVS-Restore). authoritative=true markiert einen
+// bestätigten Sync: danach gilt wieder der enge ±1 h-Advert-Korrekturdeckel.
+void setRtcTime(uint32_t epoch, bool authoritative);
+
+}  // namespace mesh_client
