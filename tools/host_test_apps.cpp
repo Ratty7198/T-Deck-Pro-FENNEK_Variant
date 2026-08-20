@@ -26,7 +26,7 @@ static uint32_t testRnd(uint32_t n) {
 
 static int s_checks = 0;
 #define CHECK(cond) do { \
-  if (!(cond)) { printf("FEHLER %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } \
+  if (!(cond)) { printf("ERROR %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } \
   s_checks++; \
 } while (0)
 
@@ -310,7 +310,7 @@ static int testPodcast() {
   const char* partial =
     "<rss><channel><item><title>Teil</title><guid>g</guid>"
     "<enclosure url=\"http://h.fm/c.mp3\" length=\"5\"/>"
-    "<description><![CDATA[ angeschnitten ...";
+    "<description><![CDATA[ cut into ...";
   CHECK(isComplete(parseLatest(partial)));
 
   // feedSlug: lesbarer Host-Präfix, deterministisch, kollisionsfrei pro URL.
@@ -335,7 +335,7 @@ static int testPodcast() {
 }
 
 // =============================================================================
-// reinschrift (Todo-Parser + konfliktsicherer Merge)
+// final draft (Todo-Parser + konfliktsicherer Merge)
 // =============================================================================
 static int testReinschrift() {
   using namespace reinschrift;
@@ -384,14 +384,14 @@ static int testReinschrift() {
   CHECK(!isOverdue(20000u * day, now));
   CHECK(!isOverdue(kSomeday, now) && !isDueToday(kSomeday, now));
 
-  // --- Konfliktsicherer Merge ------------------------------------------------
+  // --- Conflict-free merge ------------------------------------------------
   const char* remote =
-    "# Zentrale Aufgabenübersicht\n"
-    "### +Haushalt\n"
-    "- [ ] Fenster putzen +Haushalt due:2026-06-27T12:00 ^aaa111\n"
-    "- [ ] Müll raus +Haushalt due:2026-06-21T12:00 ^bbb222\n"
+    "# Overview of key tasks\n"
+    "### +Household\n"
+    "- [ ] Clean windows +Household due:2026-06-27T12:00 ^aaa111\n"
+    "- [ ] Take out the rubbish +Household due:2026-06-21T12:00 ^bbb222\n"
     "### +IT\n"
-    "- [ ] Backups prüfen +IT due:9999-12-31T00:00 ^ccc333\n";
+    "- [ ] Check backups +IT due:9999-12-31T00:00 ^ccc333\n";
 
   // Lokale Ops: aaa111 abhaken, ccc333 auf morgen, neue Aufgabe unter +Haushalt.
   Op ops[3];
