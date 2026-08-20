@@ -30,9 +30,9 @@ constexpr size_t kRawCap   = 96 * 1024;   // Markdown-Datenbank (PSRAM)
 constexpr int    kMaxTasks = 384;
 constexpr int    kMaxOps   = 64;
 
-const char* kCacheFile = "/.fennek/todo.md";
-const char* kEtagFile  = "/.fennek/todo.etag";
-const char* kOpsFile   = "/.fennek/todo_ops.tsv";
+const char* kCacheFile = "/.jarvis/todo.md";
+const char* kEtagFile  = "/.jarvis/todo.etag";
+const char* kOpsFile   = "/.jarvis/todo_ops.tsv";
 
 constexpr uint32_t kConnectTimeoutMs = 15000;
 constexpr uint16_t kHttpTimeoutMs    = 12000;
@@ -146,7 +146,7 @@ bool webdavPut(const String& url, const char* user, const char* pass,
   if (etag && etag[0]) http.addHeader("If-Match", etag);
   int code = http.sendRequest("PUT", (uint8_t*)body, len);
   http.end();
-  if (code == 412) { *conflict = true; Serial.println("[TODO] PUT 412 (Konflikt)"); return false; }
+  if (code == 412) { *conflict = true; Serial.println("[TODO] PUT 412 (Conflict)"); return false; }
   bool ok = (code >= 200 && code < 300);
   if (!ok) Serial.printf("[TODO] PUT HTTP %d\n", code);
   return ok;
@@ -167,7 +167,7 @@ int findAddOp(const char* marker) {
 void persistOps() {
   if (!board::sdReady()) return;
   spiLock();
-  SD.mkdir("/.fennek");
+  SD.mkdir("/.jarvis");
   if (s_opN == 0) {
     SD.remove(kOpsFile);
   } else {
@@ -218,7 +218,7 @@ void loadOps() {
     s_opN++;
   }
   spiLock(); f.close(); spiUnlock();
-  if (s_opN) Serial.printf("[TODO] %d offene Aenderung(en) geladen\n", s_opN);
+  if (s_opN) Serial.printf("[TODO] %d Open change(s) loaded\n", s_opN);
 }
 
 void persistCache() {
@@ -300,15 +300,15 @@ void rebuildView() {
 bool syncCore(bool useBackoff, char* log, size_t logN) {
   auto setLog = [&](const char* m) { if (log && logN) { strncpy(log, m, logN - 1); log[logN - 1] = '\0'; } };
 
-  if (!settings::todoEnabled()) { setLog("Todo-Sync aus"); return true; }
+  if (!settings::todoEnabled()) { setLog("Todo-Sync from"); return true; }
 
   char user[64], pass[65], base[160];
   settings::todoUrl(base, sizeof(base));
   settings::todoUser(user, sizeof(user));
   settings::todoPass(pass, sizeof(pass));
-  if (!base[0] || !user[0]) { setLog("WebDAV nicht konfiguriert"); return false; }
-  if (settings::wifiCount() == 0) { setLog("kein WLAN konfiguriert"); return false; }
-  if (webfm::state() != webfm::State::OFF) { setLog("WLAN belegt"); return false; }
+  if (!base[0] || !user[0]) { setLog("WebDAV not configured"); return false; }
+  if (settings::wifiCount() == 0) { setLog("no WLAN configured"); return false; }
+  if (webfm::state() != webfm::State::OFF) { setLog("WLAN in use"); return false; }
 
   if (useBackoff) {
     uint32_t cur = timesync::now();
@@ -316,7 +316,7 @@ bool syncCore(bool useBackoff, char* log, size_t logN) {
       uint8_t shift = s_failCount > kBackoffMaxShift ? kBackoffMaxShift : s_failCount;
       uint32_t wait = kBackoffBaseSecs << shift;
       if (wait > kBackoffMaxSecs) wait = kBackoffMaxSecs;
-      if (cur - s_lastAttemptEpoch < wait) { setLog("Back-off aktiv"); return false; }
+      if (cur - s_lastAttemptEpoch < wait) { setLog("Back-off active"); return false; }
     }
     s_lastAttemptEpoch = cur;
   }
@@ -340,7 +340,7 @@ bool syncCore(bool useBackoff, char* log, size_t logN) {
         char* merged = (char*)heap_caps_malloc(kRawCap, MALLOC_CAP_SPIRAM);
         if (!merged) merged = (char*)malloc(kRawCap);
         for (int attempt = 0; attempt < 2 && merged; attempt++) {
-          if (!reinschrift::applyOps(s_raw, s_ops, s_opN, merged, kRawCap)) { setLog("Merge zu gross"); break; }
+          if (!reinschrift::applyOps(s_raw, s_ops, s_opN, merged, kRawCap)) { setLog("Merge too large"); break; }
           bool conflict = false;
           if (webdavPut(url, user, pass, s_etag, merged, strlen(merged), &conflict)) {
             // Erfolg: gemergten Stand übernehmen, Queue leeren.
@@ -366,10 +366,10 @@ bool syncCore(bool useBackoff, char* log, size_t logN) {
   }
 
   char m[48];
-  if (!connected)   snprintf(m, sizeof(m), "WLAN-Fehler");
-  else if (ok && pushed) snprintf(m, sizeof(m), "%d Aenderung(en) gesendet", pushed);
-  else if (ok)      snprintf(m, sizeof(m), "Aktuell, %d Aufgaben", s_taskN);
-  else              snprintf(m, sizeof(m), "Sync fehlgeschlagen");
+  if (!connected)   snprintf(m, sizeof(m), "WLAN-Failed");
+  else if (ok && pushed) snprintf(m, sizeof(m), "%d Change(s) sent", pushed);
+  else if (ok)      snprintf(m, sizeof(m), "Currently, %d tasks", s_taskN);
+  else              snprintf(m, sizeof(m), "Sync failed");
   setLog(m);
   Serial.printf("[TODO] %s\n", m);
   return ok;
@@ -394,7 +394,7 @@ void begin() {
   if (!s_tasks) s_tasks = (Task*)malloc(sizeof(Task) * kMaxTasks);
   s_ops   = (Op*)heap_caps_malloc(sizeof(Op) * kMaxOps, MALLOC_CAP_SPIRAM);
   if (!s_ops) s_ops = (Op*)malloc(sizeof(Op) * kMaxOps);
-  if (!s_raw || !s_tasks || !s_ops) { Serial.println("[TODO] PSRAM-Allokation fehlgeschlagen"); return; }
+  if (!s_raw || !s_tasks || !s_ops) { Serial.println("[TODO] PSRAM-Allocation failed"); return; }
   s_raw[0] = '\0';
   loadCache();
   loadOps();

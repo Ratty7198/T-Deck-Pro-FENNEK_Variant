@@ -21,6 +21,10 @@
 #include <SD.h>
 #include <GxEPD2_BW.h>   // GxEPD_BLACK / GxEPD_WHITE
 #include <string.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include "core/power.h"
 
 namespace {
 
@@ -40,7 +44,7 @@ File s_upFile;
 char s_upPath[kMaxPath] = "";
 bool s_upOk = false;
 int         s_upErrCode = 507;                     // HTTP-Code bei Fehlschlag
-const char* s_upErr = "Upload fehlgeschlagen";     // Grund für die Antwort
+const char* s_upErr = "Upload failed";     // Grund für die Antwort
 
 void sendJsonErr(int code, const char* err) {
   char b[112];
@@ -57,15 +61,15 @@ void sendJsonOk() { s_server->send(200, "application/json", "{\"ok\":true}"); }
 bool argPath(char* out, size_t n, bool forWrite, bool sendError = true) {
   String p = s_server->arg("path");
   if (p.length() == 0 || p.length() >= n) {
-    if (sendError) sendJsonErr(400, "Pfad fehlt oder zu lang");
+    if (sendError) sendJsonErr(400, "Path missing or too long");
     return false;
   }
   if (p[0] != '/' || p.indexOf("..") >= 0) {
-    if (sendError) sendJsonErr(400, "ungueltiger Pfad");
+    if (sendError) sendJsonErr(400, "Invalid path");
     return false;
   }
-  if (forWrite && p.startsWith("/.fennek")) {
-    if (sendError) sendJsonErr(403, "geschuetzter Pfad");
+  if (forWrite && p.startsWith("/.jarvis")) {
+    if (sendError) sendJsonErr(403, "protected path");
     return false;
   }
   strncpy(out, p.c_str(), n - 1);
@@ -95,7 +99,7 @@ void handleList() {
   s_requests++;
   char p[kMaxPath];
   if (!argPath(p, sizeof(p), false)) return;
-  if (!board::sdReady()) { sendJsonErr(503, "keine SD-Karte"); return; }
+  if (!board::sdReady()) { sendJsonErr(503, "no SD card"); return; }
 
   String json;
   json.reserve(4096);
@@ -108,7 +112,7 @@ void handleList() {
   if (!d || !d.isDirectory()) {
     if (d) d.close();
     spiUnlock();
-    sendJsonErr(404, "kein Verzeichnis");
+    sendJsonErr(404, "no directory");
     return;
   }
   bool first = true;
@@ -136,7 +140,7 @@ void handleDownload() {
   s_requests++;
   char p[kMaxPath];
   if (!argPath(p, sizeof(p), false)) return;
-  if (!board::sdReady()) { sendJsonErr(503, "keine SD-Karte"); return; }
+  if (!board::sdReady()) { sendJsonErr(503, "no SD card"); return; }
 
   spiLock();
   File f = SD.open(p);
@@ -144,7 +148,7 @@ void handleDownload() {
   uint32_t size = ok ? f.size() : 0;
   if (f && !ok) f.close();
   spiUnlock();
-  if (!ok) { sendJsonErr(404, "Datei nicht gefunden"); return; }
+  if (!ok) { sendJsonErr(404, "file not found"); return; }
 
   const char* base = strrchr(p, '/');
   base = base ? base + 1 : p;
@@ -186,29 +190,29 @@ void handleUploadData() {
     s_upOk = false;
     s_upPath[0] = '\0';
     s_upErrCode = 507;
-    s_upErr = "Upload fehlgeschlagen";
+    s_upErr = "Upload failed";
     char dir[kMaxPath];
     if (!argPath(dir, sizeof(dir), true, false)) {
       s_upErrCode = 403;
-      s_upErr = "Zielpfad ungueltig oder geschuetzt (/.fennek)";
+      s_upErr = "Destination path invalid or protected (/.jarvis)";
       return;
     }
     if (!board::sdReady()) {
       s_upErrCode = 503;
-      s_upErr = "keine SD-Karte";
+      s_upErr = "no SD-Card";
       return;
     }
     // Dateiname auf den Basename reduzieren (Browser können Pfade mitsenden).
     const char* name = up.filename.c_str();
     const char* slash = strrchr(name, '/');
     if (slash) name = slash + 1;
-    if (!name[0]) { s_upErrCode = 400; s_upErr = "Dateiname fehlt"; return; }
+    if (!name[0]) { s_upErrCode = 400; s_upErr = "File name missing"; return; }
     int n = snprintf(s_upPath, sizeof(s_upPath), "%s/%s",
                      (strcmp(dir, "/") == 0) ? "" : dir, name);
     if (n <= 0 || n >= (int)sizeof(s_upPath)) {
       s_upPath[0] = '\0';
       s_upErrCode = 400;
-      s_upErr = "Pfad zu lang";
+      s_upErr = "Path too long";
       return;
     }
     spiLock();
@@ -216,9 +220,9 @@ void handleUploadData() {
     spiUnlock();
     if (s_upFile) {
       s_upOk = true;
-      Serial.printf("[WEBFM] Upload startet: %s\n", s_upPath);
+      Serial.printf("[WEBFM] Upload started: %s\n", s_upPath);
     } else {
-      s_upErr = "Datei nicht anlegbar (Zielordner vorhanden?)";
+      s_upErr = "File not creatable (target folder exists?)";
     }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (!s_upOk || !s_upFile) return;
@@ -231,15 +235,15 @@ void handleUploadData() {
       SD.remove(s_upPath);
       spiUnlock();
       s_upOk = false;
-      s_upErr = "Schreibfehler (SD voll?)";
-      Serial.printf("[WEBFM] Upload-Schreibfehler: %s\n", s_upPath);
+      s_upErr = "Spelling mistake (SD full?)";
+      Serial.printf("[WEBFM] Upload write error: %s\n", s_upPath);
     }
   } else if (up.status == UPLOAD_FILE_END) {
     if (s_upFile) {
       spiLock();
       s_upFile.close();
       spiUnlock();
-      Serial.printf("[WEBFM] Upload fertig: %s (%u Bytes)\n",
+      Serial.printf("[WEBFM] Upload complete: %s (%u Bytes)\n",
                     s_upPath, (unsigned)up.totalSize);
     }
   } else if (up.status == UPLOAD_FILE_ABORTED) {
@@ -250,7 +254,7 @@ void handleUploadData() {
       spiUnlock();
     }
     s_upOk = false;
-    Serial.println("[WEBFM] Upload abgebrochen");
+    Serial.println("[WEBFM] Upload aborted");
   }
 }
 
@@ -306,14 +310,14 @@ void handleDelete() {
   s_requests++;
   char p[kMaxPath];
   if (!argPath(p, sizeof(p), true)) return;
-  if (!board::sdReady()) { sendJsonErr(503, "keine SD-Karte"); return; }
+  if (!board::sdReady()) { sendJsonErr(503, "No SD-Card"); return; }
   bool force = s_server->arg("force") == "1";
 
   spiLock();
   File f = SD.open(p);
   if (!f) {
     spiUnlock();
-    sendJsonErr(404, "nicht gefunden");
+    sendJsonErr(404, "not found");
     return;
   }
   bool isDir = f.isDirectory();
@@ -330,15 +334,15 @@ void handleDelete() {
   bool ok = rmRecursive(p);
   spiUnlock();
 
-  if (ok) { Serial.printf("[WEBFM] Gelöscht: %s\n", p); sendJsonOk(); }
-  else    sendJsonErr(500, "Loeschen fehlgeschlagen");
+  if (ok) { Serial.printf("[WEBFM] Deleted: %s\n", p); sendJsonOk(); }
+  else    sendJsonErr(500, "Deletion failed");
 }
 
 void handleMkdir() {
   s_requests++;
   char p[kMaxPath];
   if (!argPath(p, sizeof(p), true)) return;
-  if (!board::sdReady()) { sendJsonErr(503, "keine SD-Karte"); return; }
+  if (!board::sdReady()) { sendJsonErr(503, "No SD-Card"); return; }
 
   spiLock();
   bool exists = SD.exists(p);
@@ -346,8 +350,8 @@ void handleMkdir() {
   spiUnlock();
 
   if (ok) sendJsonOk();
-  else if (exists) sendJsonErr(409, "existiert bereits");
-  else             sendJsonErr(500, "mkdir fehlgeschlagen");
+  else if (exists) sendJsonErr(409, "already exists");
+  else             sendJsonErr(500, "mkdir failed");
 }
 
 // --- OTA-Firmware-Update -----------------------------------------------------
@@ -359,9 +363,9 @@ void handleMkdir() {
 void drawOtaScreen(Adafruit_GFX& g) {
   g.fillScreen(GxEPD_WHITE);
   gui::printAt(g, 16, 120, "Firmware-Update", 3);
-  gui::printAt(g, 16, 160, "laeuft - bitte das Geraet", 2);
-  gui::printAt(g, 16, 184, "NICHT ausschalten.", 2);
-  gui::printAt(g, 16, 230, "Neustart erfolgt automatisch.", 2);
+  gui::printAt(g, 16, 160, "It's running – please [check/attend to] the device.", 2);
+  gui::printAt(g, 16, 184, "Do NOT switch off.", 2);
+  gui::printAt(g, 16, 230, "Restart occurs automatically..", 2);
 }
 
 // Netzfreier Versions-Endpunkt (für die Erstanzeige beim Seitenaufbau — kein
@@ -397,11 +401,11 @@ void handleOtaUpdate() {
   settings::otaUrl(url, sizeof(url));
   ota::CheckResult r = ota::check(url);
   if (!r.ok)                       { sendJsonErr(502, r.err); return; }
-  if (!r.updateAvail && !force)    { sendJsonErr(409, "kein Update verfuegbar"); return; }
+  if (!r.updateAvail && !force)    { sendJsonErr(409, "No update available"); return; }
 
   // Einmaliger Vollbild-Hinweis, dann blockierend flashen.
   display::render(drawOtaScreen, true);
-  Serial.printf("[WEBFM] OTA-Update angestossen (%s -> %s)\n", r.current, r.latest);
+  Serial.printf("[WEBFM] OTA-Update initiated (%s -> %s)\n", r.current, r.latest);
 
   char err[80] = "";
   if (ota::apply(r.url, err, sizeof(err))) {
@@ -409,6 +413,210 @@ void handleOtaUpdate() {
     s_rebootPending = true;        // poll() rebootet, sobald die Antwort raus ist
   } else {
     sendJsonErr(500, err);
+  }
+}
+
+WiFiClient* httpOpenFollow(HTTPClient& http, WiFiClientSecure& cs, WiFiClient& cp,
+                           const char* url, int* code) {
+  String cur = url;
+  for (int hop = 0; hop < 4; ++hop) {
+    bool https = cur.startsWith("https");
+    bool begun = https ? (cs.setInsecure(), http.begin(cs, cur)) : http.begin(cp, cur);
+    if (!begun) { *code = -1; return nullptr; }
+    http.setUserAgent("fennek");
+    http.setConnectTimeout(10000);
+    http.setTimeout(15000);
+    const char* hdr[] = { "Location" };
+    http.collectHeaders(hdr, 1);
+    int c = http.GET();
+    *code = c;
+    if (c == 301 || c == 302 || c == 303 || c == 307 || c == 308) {
+      String loc = http.header("Location");
+      http.end();
+      if (loc.length() == 0) return nullptr;
+      cur = loc;
+      continue;
+    }
+    if (c == 200) return http.getStreamPtr();
+    http.end();
+    return nullptr;
+  }
+  *code = -2;
+  return nullptr;
+}
+
+void handleRename() {
+  s_requests++;
+  char oldPath[kMaxPath];
+  if (!argPath(oldPath, sizeof(oldPath), true)) return;
+  if (!board::sdReady()) { sendJsonErr(503, "No SD-Card"); return; }
+
+  String np = s_server->arg("newpath");
+  if (np.length() == 0 || np.length() >= kMaxPath) {
+    sendJsonErr(400, "New path missing or too long");
+    return;
+  }
+  if (np[0] != '/' || np.indexOf("..") >= 0) {
+    sendJsonErr(400, "Invalid new path");
+    return;
+  }
+  if (np.startsWith("/.jarvis")) {
+    sendJsonErr(403, "protected path");
+    return;
+  }
+  char newPath[kMaxPath];
+  strncpy(newPath, np.c_str(), sizeof(newPath) - 1);
+  newPath[sizeof(newPath) - 1] = '\0';
+
+  spiLock();
+  bool exists = SD.exists(newPath);
+  bool ok = false;
+  if (!exists) {
+    ok = SD.rename(oldPath, newPath);
+  }
+  spiUnlock();
+
+  if (ok) {
+    Serial.printf("[WEBFM] Renamed: %s -> %s\n", oldPath, newPath);
+    sendJsonOk();
+  } else if (exists) {
+    sendJsonErr(409, "Target already exists");
+  } else {
+    sendJsonErr(500, "Rename failed");
+  }
+}
+
+void handleFetch() {
+  s_requests++;
+  String urlStr = s_server->arg("url");
+  String pathStr = s_server->arg("path");
+
+  if (urlStr.length() == 0 || pathStr.length() == 0) {
+    sendJsonErr(400, "URL or path missing");
+    return;
+  }
+
+  char dest[kMaxPath];
+  if (!argPath(dest, sizeof(dest), true)) return;
+  if (!board::sdReady()) { sendJsonErr(503, "No SD-Card"); return; }
+
+  spiLock();
+  bool isDir = false;
+  File testF = SD.open(dest);
+  if (testF) {
+    isDir = testF.isDirectory();
+    testF.close();
+  }
+  spiUnlock();
+
+  if (isDir) {
+    const char* lastSlash = strrchr(urlStr.c_str(), '/');
+    const char* filename = lastSlash ? lastSlash + 1 : "downloaded_file";
+    char cleanName[80];
+    size_t ci = 0;
+    for (const char* p = filename; *p && *p != '?' && *p != '#' && ci < sizeof(cleanName) - 1; p++) {
+      cleanName[ci++] = *p;
+    }
+    cleanName[ci] = '\0';
+    if (strlen(cleanName) == 0) {
+      strncpy(cleanName, "downloaded_file", sizeof(cleanName));
+    }
+    char tempPath[kMaxPath];
+    snprintf(tempPath, sizeof(tempPath), "%s/%s", (strcmp(dest, "/") == 0) ? "" : dest, cleanName);
+    strncpy(dest, tempPath, sizeof(dest) - 1);
+    dest[sizeof(dest) - 1] = '\0';
+  }
+
+  bool ok = false;
+  int code = 0;
+  size_t written = 0;
+
+  HTTPClient* http = new HTTPClient();
+  WiFiClientSecure* cs = new WiFiClientSecure();
+  WiFiClient* cp = new WiFiClient();
+
+  if (!http || !cs || !cp) {
+    if (http) delete http;
+    if (cs) delete cs;
+    if (cp) delete cp;
+    sendJsonErr(500, "Out of memory");
+    return;
+  }
+
+  WiFiClient* st = httpOpenFollow(*http, *cs, *cp, urlStr.c_str(), &code);
+  if (!st) {
+    delete http; delete cs; delete cp;
+    char err[128];
+    snprintf(err, sizeof(err), "HTTP GET failed (code: %d)", code);
+    sendJsonErr(code > 0 ? code : 500, err);
+    return;
+  }
+
+  int contentLen = http->getSize();
+
+  spiLock();
+  File f = SD.open(dest, FILE_WRITE);
+  spiUnlock();
+
+  if (!f) {
+    http->end(); delete http; delete cs; delete cp;
+    sendJsonErr(500, "Could not open target file for writing");
+    return;
+  }
+
+  int bufSz = 32 * 1024;
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(bufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) { bufSz = 4 * 1024; buf = (uint8_t*)malloc(bufSz); }
+
+  if (!buf) {
+    spiLock(); f.close(); spiUnlock();
+    http->end(); delete http; delete cs; delete cp;
+    sendJsonErr(500, "Out of memory (buffer)");
+    return;
+  }
+
+  ok = true;
+  uint32_t last = millis();
+  constexpr uint32_t kStallMs = 10000;
+
+  for (;;) {
+    int av = st->available();
+    if (av > 0) {
+      int want = av > bufSz ? bufSz : av;
+      int r = st->readBytes(buf, want);
+      if (r > 0) {
+        spiLock();
+        size_t w = f.write(buf, r);
+        spiUnlock();
+        if (w != (size_t)r) { ok = false; break; }
+        written += r;
+        last = millis();
+        power::noteActivity();
+        if (contentLen > 0 && written >= (size_t)contentLen) break;
+      }
+    } else {
+      if (!http->connected() && st->available() == 0) break;
+      if (millis() - last > kStallMs) {
+        ok = false;
+        Serial.printf("[WEBFM] Download stall-timeout at %u B\n", (unsigned)written);
+        break;
+      }
+      delay(5);
+    }
+  }
+
+  free(buf);
+  spiLock(); f.close(); spiUnlock();
+  http->end(); delete http; delete cs; delete cp;
+
+  if (ok) {
+    Serial.printf("[WEBFM] Download complete: %s (%u Bytes)\n", dest, (unsigned)written);
+    sendJsonOk();
+  } else {
+    spiLock();
+    SD.remove(dest);
+    spiUnlock();
+    sendJsonErr(500, "Download stalled or write failed");
   }
 }
 
@@ -421,10 +629,12 @@ void ensureServer() {
   s_server->on("/api/upload",   HTTP_POST, handleUploadDone, handleUploadData);
   s_server->on("/api/delete",   HTTP_POST, handleDelete);
   s_server->on("/api/mkdir",    HTTP_POST, handleMkdir);
+  s_server->on("/api/rename",   HTTP_POST, handleRename);
+  s_server->on("/api/fetch",    HTTP_POST, handleFetch);
   s_server->on("/api/ota/version", HTTP_GET,  handleOtaVersion);
   s_server->on("/api/ota/check",   HTTP_GET,  handleOtaCheck);
   s_server->on("/api/ota/update",  HTTP_POST, handleOtaUpdate);
-  s_server->onNotFound([]() { sendJsonErr(404, "unbekannter Endpunkt"); });
+  s_server->onNotFound([]() { sendJsonErr(404, "unknown endpoint"); });
 }
 
 }  // namespace
@@ -435,7 +645,7 @@ bool start() {
   if (s_state == State::CONNECTING || s_state == State::RUNNING) return true;
 
   if (settings::wifiCount() == 0) {
-    Serial.println("[WEBFM] Keine SSID konfiguriert ('wifi ssid <name>')");
+    Serial.println("[WEBFM] No SSID configured ('wifi ssid <name>')");
     return false;
   }
 
@@ -453,8 +663,8 @@ bool start() {
   s_requests = 0;
   s_ip[0] = '\0';
   s_state = State::CONNECTING;
-  BATTLOG_EVENT("WLAN", "an (%s)", s_ssid);   // Debug-Akku-Logger (no-op ohne BATTLOG)
-  Serial.printf("[WEBFM] Verbinde mit '%s' ... (freier Heap: %u KB)\n",
+  BATTLOG_EVENT("WLAN", "to (%s)", s_ssid);   // Debug-Akku-Logger (no-op ohne BATTLOG)
+  Serial.printf("[WEBFM] Connect with '%s' ... (freer Heap: %u KB)\n",
                 s_ssid, (unsigned)(ESP.getFreeHeap() / 1024));
   return true;
 }
@@ -468,8 +678,8 @@ void stop() {
   mesh_client::setSuspended(false);
   s_state = State::OFF;
   s_ip[0] = '\0';
-  BATTLOG_EVENT("WLAN", "aus");   // Debug-Akku-Logger (no-op ohne BATTLOG)
-  Serial.printf("[WEBFM] WiFi aus (freier Heap: %u KB)\n",
+  BATTLOG_EVENT("WLAN", "from");   // Debug-Akku-Logger (no-op ohne BATTLOG)
+  Serial.printf("[WEBFM] WiFi from (freer Heap: %u KB)\n",
                 (unsigned)(ESP.getFreeHeap() / 1024));
 }
 
@@ -482,9 +692,9 @@ void poll() {
       s_server->begin();
       if (MDNS.begin("fennek")) MDNS.addService("http", "tcp", 80);
       s_state = State::RUNNING;
-      Serial.printf("[WEBFM] Verbunden: http://%s/ (http://fennek.local/)\n", s_ip);
+      Serial.printf("[WEBFM] Connected: http://%s/ (http://fennek.local/)\n", s_ip);
     } else if (millis() - s_connectT0 > kConnectTimeoutMs) {
-      Serial.println("[WEBFM] Verbindung fehlgeschlagen (Timeout) — WiFi aus");
+      Serial.println("[WEBFM] Connection failed (Timeout) — WiFi from");
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       mesh_client::setSuspended(false);
@@ -494,7 +704,7 @@ void poll() {
     s_server->handleClient();
     if (s_rebootPending) {
       // Antwort ist raus (handleClient hat sie versandt) — jetzt neu starten.
-      Serial.println("[WEBFM] OTA fertig — Reboot in neue Version");
+      Serial.println("[WEBFM] OTA Done — Reboot into new version");
       delay(300);
       ESP.restart();
     }

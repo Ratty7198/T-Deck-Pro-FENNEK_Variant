@@ -71,10 +71,10 @@ bool importFromSd() {
   int applied = settings::importIni(buf);
   free(buf);
   if (applied < 0) {
-    Serial.println("[FENNEK] settings.ini: Parse-Fehler");
+    Serial.println("[JARVIS] settings.ini: Parse error");
     return false;
   }
-  Serial.printf("[FENNEK] settings.ini gelesen: %d Werte uebernommen\n", applied);
+  Serial.printf("[JARVIS] settings.ini read: %d values ​​accepted\n", applied);
   return applied > 0;
 }
 
