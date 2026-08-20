@@ -1,0 +1,1748 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dr. Daniel Dumke
+
+#include "settings_app.h"
+#include "config.h"
+#include "core/battery.h"
+#include "core/board.h"
+#include "core/display.h"
+#include "core/gui.h"
+#include "core/i18n.h"
+#include "core/settings.h"
+#include "mesh_client.h"
+#include "services/ota.h"
+#include "services/timesync.h"
+
+#include <Arduino.h>
+#include <GxEPD2_BW.h> // GxEPD_BLACK / GxEPD_WHITE
+#include <SD.h>
+#include <string.h>
+#include <time.h>
+
+namespace {
+
+using gui::Rect;
+
+// --- Layout
+// -------------------------------------------------------------------
+// Zwei-Ebenen-Navigation: die Wurzel zeigt Kategorien ("Ordner"), die Auswahl
+// öffnet die zugehörigen Zeilen. So bleibt jede Ebene kurz genug fürs E-Ink und
+// neue Bereiche (Navidrome …) überfüllen die Liste nicht. Kein Titel — die
+// Statuszeile zeigt bereits "Einstellungen".
+constexpr int W = EINK_W;
+constexpr int TOP = appmgr::CONTENT_Y; // 24
+constexpr int SEC_H = 15;              // Kategorie-Kopfzeile
+constexpr int ROW_H = 20;
+constexpr int VP_TOP = TOP;       // Inhalt oben
+constexpr int VAL_RIGHT = W - 22; // Wert rechtsbündig, Platz für ►
+
+const Rect kHome{6, 274, 110, 40};
+constexpr int FOOT_X = 120; // Textspalte rechts vom Button
+
+// --- Zeilen
+// ---------------------------------------------------------------------
+enum RowId {
+  ROW_PRESET,
+  ROW_FREQ,
+  ROW_BW,
+  ROW_SF,
+  ROW_CR,
+  ROW_TX,
+  ROW_NAME,
+  ROW_LANG,
+  ROW_STANDBY,
+  ROW_FONT,
+  ROW_TZ,
+  ROW_TIME,
+  ROW_WLAT,
+  ROW_WLON,
+  ROW_WSSID,
+  ROW_WPASS,
+  ROW_WDEL,
+  ROW_NAVON,
+  ROW_NAVURL,
+  ROW_NAVUSER,
+  ROW_NAVPASS,
+  ROW_AION,
+  ROW_AIURL,
+  ROW_AIMODEL,
+  ROW_OTAURL,
+  ROW_OTAVER,
+  ROW_OTAGO,
+  ROW_TODOON,
+  ROW_TODOURL,
+  ROW_TODOUSER,
+  ROW_TODOPASS,
+  ROW_TODOPATH,
+  ROW_TODOAUTO,
+  ROW_CALAUTO,
+  ROW_CALUSER,
+  ROW_CALPASS,
+  ROW_SDSTATUS,
+  ROW_SDTYPE,
+  ROW_SDTOTAL,
+  ROW_SDUSED,
+  ROW_SDFREE,
+  ROW_SDREMOUNT,
+  ROW_SDFORMAT,
+  ROW_COUNT
+};
+
+// --- Kategorien ("Ordner")
+// ------------------------------------------------------
+enum {
+  CAT_RADIO,
+  CAT_SYSTEM,
+  CAT_TIME,
+  CAT_WEATHER,
+  CAT_WIFI,
+  CAT_NAV,
+  CAT_AI,
+  CAT_OTA,
+  CAT_TODO,
+  CAT_CAL,
+  CAT_SD,
+  CAT_COUNT
+};
+
+const RowId kRadioRows[] = {ROW_PRESET, ROW_FREQ, ROW_BW,  ROW_SF,
+                            ROW_CR,     ROW_TX,   ROW_NAME};
+const RowId kSystemRows[] = {ROW_LANG, ROW_STANDBY, ROW_FONT};
+const RowId kTimeRows[] = {ROW_TZ, ROW_TIME};
+const RowId kWeatherRows[] = {ROW_WLAT, ROW_WLON};
+// Detailzeilen eines einzelnen WLAN-Profils (die WLAN-Kategorie selbst ist eine
+// dynamische Liste, siehe s_wifiIdx / drawWifiList).
+const RowId kWifiRows[] = {ROW_WSSID, ROW_WPASS, ROW_WDEL};
+const RowId kNavRows[] = {ROW_NAVON, ROW_NAVURL, ROW_NAVUSER, ROW_NAVPASS};
+const RowId kAiRows[] = {ROW_AION, ROW_AIURL, ROW_AIMODEL};
+const RowId kOtaRows[] = {ROW_OTAVER, ROW_OTAGO, ROW_OTAURL};
+const RowId kTodoRows[] = {ROW_TODOON,   ROW_TODOURL,  ROW_TODOUSER,
+                           ROW_TODOPASS, ROW_TODOPATH, ROW_TODOAUTO};
+const RowId kCalRows[] = {ROW_CALAUTO, ROW_CALUSER, ROW_CALPASS};
+const RowId kSdRows[] = {ROW_SDSTATUS, ROW_SDTYPE,    ROW_SDTOTAL, ROW_SDUSED,
+                         ROW_SDFREE,   ROW_SDREMOUNT, ROW_SDFORMAT};
+
+struct CatRows {
+  const RowId *rows;
+  int count;
+};
+const CatRows kCats[] = {
+    {kRadioRows, (int)(sizeof(kRadioRows) / sizeof(RowId))},
+    {kSystemRows, (int)(sizeof(kSystemRows) / sizeof(RowId))},
+    {kTimeRows, (int)(sizeof(kTimeRows) / sizeof(RowId))},
+    {kWeatherRows, (int)(sizeof(kWeatherRows) / sizeof(RowId))},
+    {kWifiRows, (int)(sizeof(kWifiRows) / sizeof(RowId))},
+    {kNavRows, (int)(sizeof(kNavRows) / sizeof(RowId))},
+    {kAiRows, (int)(sizeof(kAiRows) / sizeof(RowId))},
+    {kOtaRows, (int)(sizeof(kOtaRows) / sizeof(RowId))},
+    {kTodoRows, (int)(sizeof(kTodoRows) / sizeof(RowId))},
+    {kCalRows, (int)(sizeof(kCalRows) / sizeof(RowId))},
+    {kSdRows, (int)(sizeof(kSdRows) / sizeof(RowId))},
+};
+
+const char *catName(int c) {
+  switch (c) {
+  case CAT_RADIO:
+    return i18n::tr(i18n::Str::SecRadio);
+  case CAT_SYSTEM:
+    return i18n::tr(i18n::Str::SecSystem);
+  case CAT_TIME:
+    return "Clock";
+  case CAT_WEATHER:
+    return "Weather";
+  case CAT_WIFI:
+    return "WLAN";
+  case CAT_NAV:
+    return "Navidrome";
+  case CAT_AI:
+    return "AI Models";
+  case CAT_OTA:
+    return "Update";
+  case CAT_TODO:
+    return "Todo";
+  case CAT_CAL:
+    return "Calender";
+  case CAT_SD:
+    return "SD Card";
+  }
+  return "";
+}
+
+int s_cat = -1;           // -1 = Kategorie-Liste (Wurzel); sonst CAT_*
+int s_sel = 0;            // Index in der aktuellen Ebene (Kategorie bzw. Zeile)
+int s_edit = -1;          // gerade editierte Zeile (RowId; -1 = keine)
+char s_editBuf[128] = ""; // groß genug für die Navidrome-URL (127)
+
+// SD-Karte: Zwei-Schritt-Bestätigung für Format (wie OTA-Bestätigung).
+bool s_sdFormatReady =
+    false; // true = erster Druck war, zweiter Druck formatiert
+
+// SD-Info-Cache — wird außerhalb von draw() befüllt (spiLock darf in draw nicht
+// erneut genommen werden, da display::render() es bereits hält → Deadlock).
+struct SdInfo {
+  char status[16]; // "Ready" / "No Card"
+  char type[10];   // "SDHC" / "SD" / "MMC" / "Unknown"
+  char total[20];
+  char used[20];
+  char free_[20];
+};
+SdInfo s_sdInfo;
+
+static void formatBytes(char *buf, size_t n, uint64_t bytes) {
+  if (bytes >= (uint64_t)1024 * 1024 * 1024)
+    snprintf(buf, n, "%.1f GB", (double)bytes / (1024.0 * 1024 * 1024));
+  else
+    snprintf(buf, n, "%.0f MB", (double)bytes / (1024.0 * 1024));
+}
+
+// Liest SD-Infos AUSSERHALB von draw() (SPI-Bus frei, spiLock erlaubt).
+void refreshSdInfo() {
+  if (!board::sdReady()) {
+    snprintf(s_sdInfo.status, sizeof(s_sdInfo.status), "No Card");
+    snprintf(s_sdInfo.type, sizeof(s_sdInfo.type), "-");
+    snprintf(s_sdInfo.total, sizeof(s_sdInfo.total), "-");
+    snprintf(s_sdInfo.used, sizeof(s_sdInfo.used), "-");
+    snprintf(s_sdInfo.free_, sizeof(s_sdInfo.free_), "-");
+    return;
+  }
+  snprintf(s_sdInfo.status, sizeof(s_sdInfo.status), "Ready");
+  spiLock();
+  uint8_t ct = SD.cardType();
+  uint64_t total = SD.totalBytes();
+  uint64_t used = SD.usedBytes();
+  spiUnlock();
+  const char *tname = "Unknown";
+  if (ct == CARD_MMC)
+    tname = "MMC";
+  else if (ct == CARD_SD)
+    tname = "SD";
+  else if (ct == CARD_SDHC)
+    tname = "SDHC";
+  snprintf(s_sdInfo.type, sizeof(s_sdInfo.type), "%s", tname);
+  formatBytes(s_sdInfo.total, sizeof(s_sdInfo.total), total);
+  formatBytes(s_sdInfo.used, sizeof(s_sdInfo.used), used);
+  uint64_t fr = (total > used) ? (total - used) : 0;
+  formatBytes(s_sdInfo.free_, sizeof(s_sdInfo.free_), fr);
+}
+
+// WLAN-Kategorie: dynamische Liste bekannter Netze. s_wifiIdx == -1 →
+// Listenansicht (SSIDs + „Neu"-Zeile); s_wifiIdx >= 0 → Detailansicht des
+// Profils (SSID/Pass/Löschen). s_wifiAdding: gerade wird per Direkteingabe ein
+// neues Profil angelegt.
+int s_wifiIdx = -1;
+bool s_wifiAdding = false;
+
+// Zeilen der WLAN-Liste: ein Eintrag je Profil, zuletzt „+ Neues WLAN" (solange
+// Platz ist). Rückgabe = Zeilenzahl der Liste.
+int wifiListRows() {
+  int c = settings::wifiCount();
+  return c < settings::kMaxWifiProfiles ? c + 1 : c;
+}
+bool wifiIsNewRow(int idx) {
+  return idx == settings::wifiCount() &&
+         settings::wifiCount() < settings::kMaxWifiProfiles;
+}
+bool inWifiList() { return s_cat == CAT_WIFI && s_wifiIdx < 0; }
+bool inWifiDetail() { return s_cat == CAT_WIFI && s_wifiIdx >= 0; }
+
+// --- OTA-Update (Aktions-Zeile in der Kategorie „Update")
+// ---------------------- Zwei-Schritt-Bedienung wie das Web-UI: erst „Pruefen",
+// bei Treffer „Installieren".
+bool s_otaReady = false;   // true = Update gefunden, zum Flashen bereit
+char s_otaStatus[40] = ""; // Kurzstatus für die Zeile (Ergebnis/Fehler)
+char s_otaUrl[200] = "";   // firmware.bin-URL aus dem letzten Check
+// Fortschrittsanzeige (captureless DrawFns lesen diese Statics):
+char s_otaPhase[40] = ""; // aktueller Phasentext
+int s_otaPct = -1;        // 0..100, <0 = ohne Prozentzahl
+char s_otaLastPhase[40] =
+    ""; // letzte gezeichnete Phase (Voll- vs. Streifen-Refresh)
+
+// Per Tastatur editierbare Text-Zeilen (Enter startet, Enter speichert).
+bool rowEditable(int row) {
+  return row == ROW_NAME || row == ROW_WSSID || row == ROW_WPASS ||
+         row == ROW_TIME || row == ROW_WLAT || row == ROW_WLON ||
+         row == ROW_NAVURL || row == ROW_NAVUSER || row == ROW_NAVPASS ||
+         row == ROW_AIURL || row == ROW_AIMODEL || row == ROW_OTAURL ||
+         row == ROW_TODOURL || row == ROW_TODOUSER || row == ROW_TODOPASS ||
+         row == ROW_TODOPATH || row == ROW_CALUSER || row == ROW_CALPASS;
+}
+
+// Auto-Standby-Stufen (Minuten; 0 = Aus).
+const uint8_t kStandbySteps[] = {0, 2, 5, 10, 30};
+constexpr int kNumStandby = 5;
+
+// Zeitzonen-Presets (POSIX-TZ inkl. automatischer Sommerzeit). NTP/Mesh liefern
+// nur UTC; die Zone ist eine reine Anzeige-Einstellung.
+struct TzPreset {
+  const char *name;
+  const char *tz;
+};
+const TzPreset kTz[] = {
+    {"Berlin", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"London", "GMT+0BST-1,M3.5.0/01:00:00,M10.5.0/02:00:00"},
+    {"UTC", "UTC0"},
+    {"Athen", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+};
+constexpr int kNumTz = (int)(sizeof(kTz) / sizeof(kTz[0]));
+
+// Presets (Quelle: MeshCore-Community; Narrow = Standard in DE/NRW,
+// identisch zu Daniels Repeater: 869,618 / 62,5 / SF8 / CR4-5).
+struct Preset {
+  const char *name;
+  settings::MeshParams p;
+};
+const Preset kPresets[] = {
+    {"UK Narrow", {869.618f, 62.5f, 8, 5, 22}},
+    {"EU Klassisch", {869.525f, 250.0f, 11, 5, 22}},
+};
+constexpr int kNumPresets = 2;
+
+void markDirty() { appmgr::markDirty(); }
+
+// Passt der aktuelle Parametersatz zu einem Preset? (-1 = manuell)
+int matchPreset(const settings::MeshParams &p) {
+  for (int i = 0; i < kNumPresets; i++) {
+    const settings::MeshParams &q = kPresets[i].p;
+    if (p.freqMhz == q.freqMhz && p.bwKhz == q.bwKhz && p.sf == q.sf &&
+        p.cr == q.cr)
+      return i;
+  }
+  return -1;
+}
+
+// Parameter speichern + live anwenden.
+void apply(const settings::MeshParams &p) {
+  settings::setMeshParams(p);
+  mesh_client::applyRadioParams();
+  markDirty();
+}
+
+// Bandbreiten-Stufen (LoRa-üblich).
+float nextBw(float bw, int dir) {
+  const float steps[] = {62.5f, 125.0f, 250.0f, 500.0f};
+  int idx = 0;
+  for (int i = 0; i < 4; i++)
+    if (bw == steps[i])
+      idx = i;
+  idx += dir;
+  if (idx < 0)
+    idx = 3;
+  if (idx > 3)
+    idx = 0;
+  return steps[idx];
+}
+
+// Wert der Zeile ändern (dir = -1/+1).
+void changeRow(int row, int dir) {
+  if (row == ROW_LANG) {
+    int n = (int)i18n::Lang::COUNT;
+    int l = ((int)i18n::lang() + dir + n) % n;
+    i18n::setLang((i18n::Lang)l);
+    markDirty();
+    return;
+  }
+  if (row == ROW_STANDBY) {
+    uint8_t cur = settings::standbyMinutes();
+    int idx = 0;
+    for (int i = 0; i < kNumStandby; i++)
+      if (kStandbySteps[i] == cur)
+        idx = i;
+    idx = (idx + dir + kNumStandby) % kNumStandby;
+    settings::setStandbyMinutes(kStandbySteps[idx]);
+    markDirty();
+    return;
+  }
+  if (row == ROW_TZ) {
+    char cur[48];
+    settings::tzString(cur, sizeof(cur));
+    int idx = 0;
+    for (int i = 0; i < kNumTz; i++)
+      if (strcmp(kTz[i].tz, cur) == 0)
+        idx = i;
+    idx = (idx + dir + kNumTz) % kNumTz;
+    settings::setTzString(kTz[idx].tz);
+    timesync::applyTimezone();
+    markDirty();
+    return;
+  }
+  if (row == ROW_FONT) {
+    // Nur zwei Stufen (klein/groß) — jede Richtung toggelt.
+    settings::setFontScale(settings::fontScale() >= 2 ? 1 : 2);
+    markDirty();
+    return;
+  }
+  if (row == ROW_NAVON) {
+    settings::setNavEnabled(!settings::navEnabled());
+    markDirty();
+    return;
+  }
+  if (row == ROW_AION) {
+    settings::setAiEnabled(!settings::aiEnabled());
+    markDirty();
+    return;
+  }
+  if (row == ROW_TODOON) {
+    settings::setTodoEnabled(!settings::todoEnabled());
+    markDirty();
+    return;
+  }
+  if (row == ROW_TODOAUTO) {
+    settings::setTodoAutoSync(!settings::todoAutoSync());
+    markDirty();
+    return;
+  }
+  if (row == ROW_CALAUTO) {
+    settings::setCalAutoSync(!settings::calAutoSync());
+    markDirty();
+    return;
+  }
+  settings::MeshParams p = settings::meshParams();
+  switch (row) {
+  case ROW_PRESET: {
+    int cur = matchPreset(p);
+    int next = (cur < 0) ? (dir > 0 ? 0 : kNumPresets - 1)
+                         : (cur + dir + kNumPresets) % kNumPresets;
+    settings::MeshParams np = kPresets[next].p;
+    np.txDbm = p.txDbm; // Sendeleistung bleibt persönliche Wahl
+    apply(np);
+    return;
+  }
+  case ROW_FREQ:
+    p.freqMhz += dir * 0.025f;
+    if (p.freqMhz < 863.0f)
+      p.freqMhz = 863.0f;
+    if (p.freqMhz > 870.0f)
+      p.freqMhz = 870.0f;
+    break;
+  case ROW_BW:
+    p.bwKhz = nextBw(p.bwKhz, dir);
+    break;
+  case ROW_SF:
+    p.sf = (uint8_t)constrain((int)p.sf + dir, 7, 12);
+    break;
+  case ROW_CR:
+    p.cr = (uint8_t)constrain((int)p.cr + dir, 5, 8);
+    break;
+  case ROW_TX:
+    p.txDbm = (uint8_t)constrain((int)p.txDbm + dir, 1, 22);
+    break;
+  default:
+    return; // Text-Zeilen (Name/WLAN/Navidrome) per Enter editieren
+  }
+  apply(p);
+}
+
+const char *rowName(int row) {
+  using i18n::Str;
+  switch (row) {
+  case ROW_PRESET:
+    return "Preset"; // LoRa-Jargon, nicht übersetzt
+  case ROW_FREQ:
+    return i18n::tr(Str::LblFreq);
+  case ROW_BW:
+    return i18n::tr(Str::LblBandwidth);
+  case ROW_SF:
+    return "Spreading"; // LoRa-Jargon
+  case ROW_CR:
+    return i18n::tr(Str::LblCodingRate);
+  case ROW_TX:
+    return i18n::tr(Str::LblTxPower);
+  case ROW_NAME:
+    return i18n::tr(Str::LblName);
+  case ROW_LANG:
+    return i18n::tr(Str::SettingsLang);
+  case ROW_STANDBY:
+    return i18n::tr(Str::LblStandby);
+  case ROW_FONT:
+    return i18n::tr(Str::LblFontSize);
+  case ROW_TZ:
+    return "Timezone";
+  case ROW_TIME:
+    return "Time";
+  case ROW_WLAT:
+    return "Weather Lat";
+  case ROW_WLON:
+    return "Weather Lon";
+  case ROW_WSSID:
+    return i18n::tr(Str::LblWifiSsid);
+  case ROW_WPASS:
+    return i18n::tr(Str::LblWifiPass);
+  case ROW_WDEL:
+    return "Delete";
+  case ROW_NAVON:
+    return "Scrobbling";
+  case ROW_NAVURL:
+    return "Server";
+  case ROW_NAVUSER:
+    return "User";
+  case ROW_NAVPASS:
+    return "Password";
+  case ROW_AION:
+    return "Writing";
+  case ROW_AIURL:
+    return "Server";
+  case ROW_AIMODEL:
+    return "Model";
+  case ROW_OTAVER:
+    return "Version";
+  case ROW_OTAGO:
+    return "Refresh";
+  case ROW_OTAURL:
+    return "Which";
+  case ROW_TODOON:
+    return "Sync";
+  case ROW_TODOURL:
+    return "Server";
+  case ROW_TODOUSER:
+    return "User";
+  case ROW_TODOPASS:
+    return "Password";
+  case ROW_TODOPATH:
+    return "Pfad";
+  case ROW_TODOAUTO:
+    return "Auto-Sync";
+  case ROW_CALAUTO:
+    return "Auto-Sync";
+  case ROW_CALUSER:
+    return "CalDAV-User";
+  case ROW_CALPASS:
+    return "CalDAV-Pass";
+  case ROW_SDSTATUS:
+    return "Status";
+  case ROW_SDTYPE:
+    return "Type";
+  case ROW_SDTOTAL:
+    return "Total";
+  case ROW_SDUSED:
+    return "Used";
+  case ROW_SDFREE:
+    return "Free";
+  case ROW_SDREMOUNT:
+    return "Remount";
+  case ROW_SDFORMAT:
+    return "Format";
+  }
+  return "";
+}
+
+void rowValue(int row, char *v, size_t n) {
+  v[0] = '\0';
+  settings::MeshParams p = settings::meshParams();
+  switch (row) {
+  case ROW_PRESET: {
+    int m = matchPreset(p);
+    snprintf(v, n, "%s",
+             m >= 0 ? kPresets[m].name : i18n::tr(i18n::Str::SettingsManual));
+    break;
+  }
+  case ROW_FREQ:
+    snprintf(v, n, "%.3f MHz", (double)p.freqMhz);
+    break;
+  case ROW_BW:
+    snprintf(v, n, "%.1f kHz", (double)p.bwKhz);
+    break;
+  case ROW_SF:
+    snprintf(v, n, "SF%u", p.sf);
+    break;
+  case ROW_CR:
+    snprintf(v, n, "4/%u", p.cr);
+    break;
+  case ROW_TX:
+    snprintf(v, n, "%u dBm", p.txDbm);
+    break;
+  case ROW_NAME:
+    if (s_edit == ROW_NAME)
+      snprintf(v, n, "%s_", s_editBuf);
+    else
+      settings::meshName(v, n);
+    break;
+  case ROW_LANG:
+    snprintf(v, n, "%s", i18n::langName(i18n::lang()));
+    break;
+  case ROW_STANDBY: {
+    uint8_t m = settings::standbyMinutes();
+    if (m == 0)
+      snprintf(v, n, "%s", i18n::tr(i18n::Str::StandbyOff));
+    else
+      snprintf(v, n, "%u min", m);
+    break;
+  }
+  case ROW_FONT:
+    snprintf(v, n, "%s",
+             settings::fontScale() >= 2 ? i18n::tr(i18n::Str::FontLarge)
+                                        : i18n::tr(i18n::Str::FontSmall));
+    break;
+  case ROW_TZ: {
+    char tz[48];
+    settings::tzString(tz, sizeof(tz));
+    int idx = -1;
+    for (int i = 0; i < kNumTz; i++)
+      if (strcmp(kTz[i].tz, tz) == 0)
+        idx = i;
+    snprintf(v, n, "%s", idx >= 0 ? kTz[idx].name : "own");
+    break;
+  }
+  case ROW_TIME:
+    // Beim Editieren der Eingabepuffer; sonst die aktuelle lokale Uhrzeit.
+    if (s_edit == ROW_TIME)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      time_t tt = (time_t)timesync::now();
+      struct tm lt;
+      localtime_r(&tt, &lt);
+      snprintf(v, n, "%02u:%02u", (unsigned)lt.tm_hour, (unsigned)lt.tm_min);
+    }
+    break;
+  case ROW_WLAT: {
+    double lat = 52.52;
+    settings::weatherPos(&lat, nullptr);
+    if (s_edit == ROW_WLAT)
+      snprintf(v, n, "%s_", s_editBuf);
+    else
+      snprintf(v, n, "%.5f", lat);
+    break;
+  }
+  case ROW_WLON: {
+    double lon = 13.41;
+    settings::weatherPos(nullptr, &lon);
+    if (s_edit == ROW_WLON)
+      snprintf(v, n, "%s_", s_editBuf);
+    else
+      snprintf(v, n, "%.5f", lon);
+    break;
+  }
+  case ROW_WSSID:
+    if (s_edit == ROW_WSSID)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::wifiSsidAt(s_wifiIdx, v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_WPASS:
+    // Klartext nur während der Eingabe; sonst nur "gesetzt"-Indikator.
+    if (s_edit == ROW_WPASS)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      char pw[65];
+      settings::wifiPassAt(s_wifiIdx, pw, sizeof(pw));
+      snprintf(v, n, "%s", pw[0] ? "****" : "-");
+    }
+    break;
+  case ROW_WDEL:
+    snprintf(v, n, "%s", ""); // reine Aktionszeile
+    break;
+  case ROW_NAVON:
+    snprintf(v, n, "%s", settings::navEnabled() ? "To" : "From");
+    break;
+  case ROW_NAVURL:
+    if (s_edit == ROW_NAVURL)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::navUrl(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_NAVUSER:
+    if (s_edit == ROW_NAVUSER)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::navUser(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_NAVPASS:
+    if (s_edit == ROW_NAVPASS)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      char pw[65];
+      settings::navPass(pw, sizeof(pw));
+      snprintf(v, n, "%s", pw[0] ? "****" : "-");
+    }
+    break;
+  case ROW_AION:
+    snprintf(v, n, "%s", settings::aiEnabled() ? "An" : "Aus");
+    break;
+  case ROW_AIURL:
+    if (s_edit == ROW_AIURL)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::aiUrl(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_AIMODEL:
+    if (s_edit == ROW_AIMODEL)
+      snprintf(v, n, "%s_", s_editBuf);
+    else
+      settings::aiModel(v, n);
+    break;
+  case ROW_OTAVER:
+    snprintf(v, n, "%s", FENNEK_VERSION);
+    break;
+  case ROW_OTAGO:
+    // Ready: "Neu: <ver>" (Footer sagt „Enter installiert"); sonst
+    // Status/„Pruefen".
+    if (s_otaStatus[0])
+      snprintf(v, n, "%s", s_otaStatus);
+    else
+      snprintf(v, n, "Please check");
+    break;
+  case ROW_OTAURL:
+    if (s_edit == ROW_OTAURL)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::otaUrl(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_TODOON:
+    snprintf(v, n, "%s", settings::todoEnabled() ? "To" : "From");
+    break;
+  case ROW_TODOURL:
+    if (s_edit == ROW_TODOURL)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::todoUrl(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_TODOUSER:
+    if (s_edit == ROW_TODOUSER)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::todoUser(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_TODOPASS:
+    if (s_edit == ROW_TODOPASS)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      char pw[65];
+      settings::todoPass(pw, sizeof(pw));
+      snprintf(v, n, "%s", pw[0] ? "****" : "-");
+    }
+    break;
+  case ROW_TODOPATH:
+    if (s_edit == ROW_TODOPATH)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::todoPath(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_TODOAUTO:
+    snprintf(v, n, "%s", settings::todoAutoSync() ? "To" : "From");
+    break;
+  case ROW_CALAUTO:
+    snprintf(v, n, "%s", settings::calAutoSync() ? "To" : "From");
+    break;
+  case ROW_CALUSER:
+    if (s_edit == ROW_CALUSER)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      settings::calDavUser(v, n);
+      if (!v[0])
+        snprintf(v, n, "-");
+    }
+    break;
+  case ROW_CALPASS:
+    if (s_edit == ROW_CALPASS)
+      snprintf(v, n, "%s_", s_editBuf);
+    else {
+      char pw[65];
+      settings::calDavPass(pw, sizeof(pw));
+      snprintf(v, n, "%s", pw[0] ? "****" : "-");
+    }
+    break;
+  // --- SD Card rows — read from cache (populated outside draw/spiLock) -------
+  case ROW_SDSTATUS:
+    snprintf(v, n, "%s", s_sdInfo.status);
+    break;
+  case ROW_SDTYPE:
+    snprintf(v, n, "%s", s_sdInfo.type);
+    break;
+  case ROW_SDTOTAL:
+    snprintf(v, n, "%s", s_sdInfo.total);
+    break;
+  case ROW_SDUSED:
+    snprintf(v, n, "%s", s_sdInfo.used);
+    break;
+  case ROW_SDFREE:
+    snprintf(v, n, "%s", s_sdInfo.free_);
+    break;
+  case ROW_SDREMOUNT:
+    snprintf(v, n, "%s", board::sdReady() ? "OK" : "!");
+    break;
+  case ROW_SDFORMAT:
+    snprintf(v, n, "%s", s_sdFormatReady ? "Confirm" : "FAT32");
+    break;
+  }
+}
+
+// --- OTA-Fortschrittsanzeige
+// ---------------------------------------------------- Balken-Geometrie; der
+// renderRegion-Streifen ist 8er-ausgerichtet (E-Ink).
+constexpr int kBarX = 14;
+constexpr int kBarY = 160;
+constexpr int kBarW = W - 28;
+constexpr int kBarH = 20;
+constexpr int kBarRegY = 152; // Streifen deckt Balken + %-Zahl
+constexpr int kBarRegH = 56;
+
+void drawProgressBar(Adafruit_GFX &g) {
+  g.setTextColor(GxEPD_BLACK);
+  g.drawRect(kBarX, kBarY, kBarW, kBarH, GxEPD_BLACK);
+  int pct = s_otaPct < 0 ? 0 : (s_otaPct > 100 ? 100 : s_otaPct);
+  int fill = (kBarW - 4) * pct / 100;
+  if (fill > 0)
+    g.fillRect(kBarX + 2, kBarY + 2, fill, kBarH - 4, GxEPD_BLACK);
+  char pc[8];
+  snprintf(pc, sizeof(pc), "%d%%", pct);
+  g.setTextSize(2);
+  uint16_t pw, ph;
+  gui::textBounds(g, pc, &pw, &ph);
+  g.setCursor(W / 2 - pw / 2, kBarY + kBarH + 8);
+  gui::print(g, pc);
+}
+
+// Captureless DrawFn fürs Vollbild-Fortschrittsframe (liest
+// s_otaPhase/s_otaPct).
+void drawOtaFrame(Adafruit_GFX &g) {
+  g.setTextColor(GxEPD_BLACK);
+  g.setTextSize(2);
+  g.setCursor(10, 50);
+  gui::print(g, "Firmware-Update");
+  g.drawFastHLine(0, 74, W, GxEPD_BLACK);
+  g.setTextSize(1);
+  g.setCursor(12, 112);
+  gui::print(g, s_otaPhase);
+  if (s_otaPct >= 0)
+    drawProgressBar(g);
+  g.setTextSize(1);
+  g.setCursor(12, 290);
+  gui::print(g, "Do NOT switch off the device!");
+}
+
+// Fortschritts-Callback (an ota::deviceCheck/deviceApply übergeben). Bei
+// Phasenwechsel Vollbild, bei reiner %-Aktualisierung nur den Balkenstreifen —
+// das hält die häufigen Schreib-Updates flackerarm. Läuft blockierend im
+// loop()-Kontext (Audio/Mesh ruhen), darf also direkt aufs E-Ink zeichnen.
+void otaShow(const char *phase, int pct) {
+  s_otaPct = pct;
+  bool phaseChanged = strcmp(phase, s_otaLastPhase) != 0;
+  snprintf(s_otaPhase, sizeof(s_otaPhase), "%s", phase);
+  if (phaseChanged) {
+    snprintf(s_otaLastPhase, sizeof(s_otaLastPhase), "%s", phase);
+    display::render(drawOtaFrame, true);
+  } else {
+    display::renderRegion(drawProgressBar, kBarRegY, kBarRegH);
+  }
+}
+
+// „Aktualisieren"-Zeile: 1. Druck prüft, 2. Druck (wenn ready) flasht +
+// rebootet.
+void runOtaAction() {
+  s_otaLastPhase[0] = '\0'; // erster Frame des Laufs immer Vollbild
+  s_otaPct = -1;
+
+  if (!s_otaReady) {
+    ota::CheckResult r = ota::deviceCheck(otaShow);
+    if (!r.ok) {
+      snprintf(s_otaStatus, sizeof(s_otaStatus), "%s", r.err);
+      s_otaReady = false;
+    } else if (r.updateAvail) {
+      snprintf(s_otaUrl, sizeof(s_otaUrl), "%s", r.url);
+      snprintf(s_otaStatus, sizeof(s_otaStatus), "New: %s", r.latest);
+      s_otaReady = true;
+    } else {
+      snprintf(s_otaStatus, sizeof(s_otaStatus), "Latest");
+      s_otaReady = false;
+    }
+    markDirty(); // Progress-Frame durch Settings-Screen ersetzen
+    return;
+  }
+
+  // Bereit → flashen. Erfolg rebootet (kehrt nicht zurück), Fehler fällt durch.
+  char err[80] = "";
+  ota::deviceApply(s_otaUrl, otaShow, err, sizeof(err));
+  snprintf(s_otaStatus, sizeof(s_otaStatus), "%s", err[0] ? err : "Failed");
+  s_otaReady = false;
+  markDirty();
+}
+
+// --- Treffer-Zonen (Touch)
+// ------------------------------------------------------ Welche Kategorie liegt
+// unter dem Tap bei y (Wurzelansicht)? -1 = keine.
+int hitCat(int ty) {
+  int y = VP_TOP;
+  for (int i = 0; i < CAT_COUNT; i++) {
+    if (ty >= y && ty < y + ROW_H)
+      return i;
+    y += ROW_H;
+  }
+  return -1;
+}
+
+// Welcher Zeilen-Index (innerhalb der Kategorie) liegt unter dem Tap? -1 =
+// keiner.
+int hitRow(int ty) {
+  int y = VP_TOP + SEC_H; // Zeilen beginnen unter der Kopfzeile
+  for (int i = 0; i < kCats[s_cat].count; i++) {
+    if (ty >= y && ty < y + ROW_H)
+      return i;
+    y += ROW_H;
+  }
+  return -1;
+}
+
+// --- Zeichnen
+// -------------------------------------------------------------------
+// Kategorie-Zeile (Wurzel): Name groß + ►; ausgewählt mit Doppelrahmen.
+void drawCatRow(Adafruit_GFX &g, int idx, int y) {
+  g.setTextSize(2);
+  g.setCursor(10, y + 4);
+  gui::print(g, catName(idx));
+  g.drawFastHLine(0, y + ROW_H, W, GxEPD_BLACK);
+  g.setTextSize(1);
+  g.setCursor(W - 13, y + 8);
+  g.write((uint8_t)0x10); // ►
+  if (idx == s_sel) {
+    g.drawRect(0, y, W, ROW_H, GxEPD_BLACK);
+    g.drawRect(1, y + 1, W - 2, ROW_H - 2, GxEPD_BLACK);
+  }
+}
+
+// Zeile der WLAN-Liste: SSID (bzw. „+ Neues WLAN") groß + ►, ausgewählt
+// gerahmt.
+void drawWifiListRow(Adafruit_GFX &g, int idx, int y) {
+  char label[40];
+  if (wifiIsNewRow(idx)) {
+    snprintf(label, sizeof(label), "+ New WLAN");
+  } else {
+    char ssid[33];
+    settings::wifiSsidAt(idx, ssid, sizeof(ssid));
+    snprintf(label, sizeof(label), "%s", ssid[0] ? ssid : "(leer)");
+  }
+  g.setTextSize(2);
+  g.setCursor(10, y + 4);
+  gui::print(g, label);
+  g.drawFastHLine(0, y + ROW_H, W, GxEPD_BLACK);
+  g.setTextSize(1);
+  g.setCursor(W - 13, y + 8);
+  g.write((uint8_t)0x10); // ►
+  if (idx == s_sel) {
+    g.drawRect(0, y, W, ROW_H, GxEPD_BLACK);
+    g.drawRect(1, y + 1, W - 2, ROW_H - 2, GxEPD_BLACK);
+  }
+}
+
+// Einstellungs-Zeile: Label klein links, Wert groß rechtsbündig; ausgewählte
+// Zeile mit Doppelrahmen + ◄/►-Pfeilen (Tap-Hälften bzw. A/D).
+void drawRow(Adafruit_GFX &g, int row, int y, bool selected) {
+  g.setTextSize(1);
+  uint16_t lw, lh;
+  gui::textBounds(g, rowName(row), &lw, &lh);
+  g.setCursor(10, y + 8);
+  gui::print(g, rowName(row));
+
+  char v[64];
+  rowValue(row, v, sizeof(v));
+  g.setTextSize(2);
+  uint16_t vw, vh;
+  gui::textBounds(g, v, &vw, &vh);
+  int vx = VAL_RIGHT - (int)vw;
+  int vy = y + 5;
+  if (vx < 10 + (int)lw + 8) { // zu lang (z. B. URL/Name): klein rendern
+    g.setTextSize(1);
+    gui::textBounds(g, v, &vw, &vh);
+    vx = VAL_RIGHT - (int)vw;
+    if (vx < 10 + (int)lw + 8)
+      vx = 10 + (int)lw + 8;
+    vy = y + 8;
+  }
+  g.setCursor(vx, vy);
+  gui::print(g, v);
+
+  g.drawFastHLine(0, y + ROW_H, W, GxEPD_BLACK);
+
+  if (selected) {
+    g.drawRect(0, y, W, ROW_H, GxEPD_BLACK);
+    g.drawRect(1, y + 1, W - 2, ROW_H - 2, GxEPD_BLACK);
+    bool isAction = (row == ROW_OTAGO || row == ROW_WDEL ||
+                     row == ROW_SDREMOUNT || row == ROW_SDFORMAT);
+    bool isInfo =
+        (row == ROW_SDSTATUS || row == ROW_SDTYPE || row == ROW_SDTOTAL ||
+         row == ROW_SDUSED || row == ROW_SDFREE);
+    if (!rowEditable(row) && !isAction && !isInfo) { // cycle rows get ◄/►
+      g.setTextSize(1);
+      g.setCursor(vx - 15, y + 8);
+      g.write((uint8_t)0x11); // ◄
+      g.setCursor(W - 13, y + 8);
+      g.write((uint8_t)0x10); // ►
+    }
+  }
+}
+
+void startEdit(int row) {
+  s_editBuf[0] = '\0';
+  switch (row) {
+  case ROW_NAME:
+    settings::meshName(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_WLAT: {
+    double lat = 52.52;
+    settings::weatherPos(&lat, nullptr);
+    snprintf(s_editBuf, sizeof(s_editBuf), "%0.5f", lat);
+    break;
+  }
+  case ROW_WLON: {
+    double lon = 13.41;
+    settings::weatherPos(nullptr, &lon);
+    snprintf(s_editBuf, sizeof(s_editBuf), "%0.5f", lon);
+    break;
+  }
+  case ROW_WSSID:
+    if (!s_wifiAdding)
+      settings::wifiSsidAt(s_wifiIdx, s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_WPASS:
+    settings::wifiPassAt(s_wifiIdx, s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_NAVURL:
+    settings::navUrl(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_NAVUSER:
+    settings::navUser(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_NAVPASS:
+    settings::navPass(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_AIURL:
+    settings::aiUrl(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_AIMODEL:
+    settings::aiModel(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_OTAURL:
+    settings::otaUrl(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_TODOURL:
+    settings::todoUrl(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_TODOUSER:
+    settings::todoUser(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_TODOPASS:
+    settings::todoPass(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_TODOPATH:
+    settings::todoPath(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_CALUSER:
+    settings::calDavUser(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_CALPASS:
+    settings::calDavPass(s_editBuf, sizeof(s_editBuf));
+    break;
+  case ROW_TIME: {
+    // Mit der aktuellen lokalen Zeit als Vorlage vorbelegen.
+    time_t tt = (time_t)timesync::now();
+    struct tm lt;
+    localtime_r(&tt, &lt);
+    snprintf(s_editBuf, sizeof(s_editBuf), "%04d-%02d-%02d %02d:%02d",
+             lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour,
+             lt.tm_min);
+    break;
+  }
+  default:
+    return;
+  }
+  s_edit = row;
+  markDirty();
+}
+
+void finishEdit(bool save) {
+  if (save) {
+    switch (s_edit) {
+    // Leerer Node-Name wird verworfen; leere WLAN-/Navidrome-Werte löschen.
+    case ROW_NAME:
+      if (s_editBuf[0])
+        mesh_client::setNodeName(s_editBuf);
+      break;
+    case ROW_WLAT: {
+      double lat = atof(s_editBuf);
+      settings::setWeatherPos(lat, 13.41);
+      break;
+    }
+    case ROW_WLON: {
+      double lon = atof(s_editBuf);
+      double lat = 52.52;
+      settings::weatherPos(&lat, nullptr);
+      settings::setWeatherPos(lat, lon);
+      break;
+    }
+    case ROW_WSSID:
+      if (s_wifiAdding) {
+        // Direkteingabe eines neuen Profils: nur bei nicht-leerer SSID anlegen.
+        if (s_editBuf[0])
+          settings::wifiSet(settings::wifiCount(), s_editBuf, "");
+      } else {
+        char keepPass[65];
+        settings::wifiPassAt(s_wifiIdx, keepPass, sizeof(keepPass));
+        settings::wifiSet(s_wifiIdx, s_editBuf,
+                          keepPass); // leere SSID löscht das Profil
+      }
+      break;
+    case ROW_WPASS: {
+      char keepSsid[33];
+      settings::wifiSsidAt(s_wifiIdx, keepSsid, sizeof(keepSsid));
+      settings::wifiSet(s_wifiIdx, keepSsid, s_editBuf);
+      break;
+    }
+    case ROW_NAVURL:
+      settings::setNavUrl(s_editBuf);
+      break;
+    case ROW_NAVUSER:
+      settings::setNavUser(s_editBuf);
+      break;
+    case ROW_NAVPASS:
+      settings::setNavPass(s_editBuf);
+      break;
+    case ROW_AIURL:
+      settings::setAiUrl(s_editBuf);
+      break;
+    case ROW_AIMODEL:
+      settings::setAiModel(s_editBuf);
+      break;
+    case ROW_OTAURL:
+      settings::setOtaUrl(s_editBuf);
+      break;
+    case ROW_TODOURL:
+      settings::setTodoUrl(s_editBuf);
+      break;
+    case ROW_TODOUSER:
+      settings::setTodoUser(s_editBuf);
+      break;
+    case ROW_TODOPASS:
+      settings::setTodoPass(s_editBuf);
+      break;
+    case ROW_TODOPATH:
+      settings::setTodoPath(s_editBuf);
+      break;
+    case ROW_CALUSER:
+      settings::setCalDavUser(s_editBuf);
+      break;
+    case ROW_CALPASS:
+      settings::setCalDavPass(s_editBuf);
+      break;
+    case ROW_TIME: {
+      // "YYYY-MM-DD HH:MM" als lokale Zeit lesen → über die Zeitzone nach UTC.
+      struct tm lt;
+      memset(&lt, 0, sizeof(lt));
+      int y, mo, d, h, mi;
+      if (sscanf(s_editBuf, "%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5) {
+        lt.tm_year = y - 1900;
+        lt.tm_mon = mo - 1;
+        lt.tm_mday = d;
+        lt.tm_hour = h;
+        lt.tm_min = mi;
+        lt.tm_isdst = -1;
+        time_t utc = mktime(&lt);
+        if (utc > 0)
+          timesync::setManualTime((uint32_t)utc);
+      }
+      break;
+    }
+    }
+  }
+  int wasEdit = s_edit;
+  s_edit = -1;
+  // Nach Anlegen eines neuen WLANs bzw. wenn die SSID-Bearbeitung das Profil
+  // geleert (gelöscht) hat: zurück in die WLAN-Liste.
+  if (s_wifiAdding) {
+    s_wifiAdding = false;
+    s_wifiIdx = -1;
+    s_sel = 0;
+  } else if (save && inWifiDetail() && wasEdit == ROW_WSSID &&
+             (s_editBuf[0] == '\0' || s_wifiIdx >= settings::wifiCount())) {
+    s_wifiIdx = -1;
+    s_sel = 0;
+  }
+  markDirty();
+}
+
+// Aktuell ausgewählte Zeile (RowId) innerhalb der geöffneten Kategorie; -1
+// Wurzel. In der WLAN-Detailansicht liefern die kWifiRows die Zeilen.
+int curRow() {
+  if (s_cat < 0)
+    return -1;
+  if (inWifiList())
+    return -1; // Liste hat keine RowId-Zeilen
+  return kCats[s_cat].rows[s_sel];
+}
+
+void onKey(char k) {
+  // Editiermodus: Tasten gehen in den Text (Name/SSID/Passwort/URL …).
+  if (s_edit >= 0) {
+    if (k == '\r') {
+      finishEdit(true);
+      return;
+    }
+    if (k == 0x02) {
+      finishEdit(false);
+      return;
+    } // Mic = abbrechen
+    if (k == '\b') {
+      int len = strlen(s_editBuf);
+      if (len > 0) {
+        s_editBuf[len - 1] = '\0';
+        markDirty();
+      } else
+        finishEdit(false);
+      return;
+    }
+    // Eingabelimits je Feld: URL 127, Passwort 64, Benutzer 63, sonst 32.
+    int maxLen;
+    switch (s_edit) {
+    case ROW_NAVURL:
+    case ROW_TODOURL:
+    case ROW_TODOPATH:
+      maxLen = 127;
+      break;
+    case ROW_WLAT:
+    case ROW_WLON:
+      maxLen = 32;
+      break;
+    case ROW_WPASS:
+    case ROW_NAVPASS:
+    case ROW_TODOPASS:
+    case ROW_CALPASS:
+      maxLen = 64;
+      break;
+    case ROW_NAVUSER:
+    case ROW_TODOUSER:
+    case ROW_CALUSER:
+      maxLen = 63;
+      break;
+    default:
+      maxLen = 32;
+      break;
+    }
+    if (k >= 32 && k < 127) {
+      int len = strlen(s_editBuf);
+      if (len < maxLen && len < (int)sizeof(s_editBuf) - 1) {
+        s_editBuf[len] = k;
+        s_editBuf[len + 1] = '\0';
+        markDirty();
+      }
+    }
+    return;
+  }
+
+  // Wurzelebene: Kategorien durchblättern, Enter/► öffnet.
+  if (s_cat < 0) {
+    switch (k) {
+    case 'w':
+    case 'W':
+    case 'i':
+    case 'I':
+      s_sel = (s_sel + CAT_COUNT - 1) % CAT_COUNT;
+      markDirty();
+      break;
+    case 's':
+    case 'S':
+    case 'k':
+    case 'K':
+      s_sel = (s_sel + 1) % CAT_COUNT;
+      markDirty();
+      break;
+    case '\r':
+    case 'd':
+    case 'D':
+    case 'l':
+    case 'L':
+      s_cat = s_sel;
+      s_sel = 0;
+      s_wifiIdx = -1;
+      s_wifiAdding = false;
+      if (s_cat == CAT_SD)
+        refreshSdInfo(); // cache before first draw
+      markDirty();
+      break;
+    case '\b':
+    case 'q':
+    case 'Q':
+      appmgr::goHome();
+      break;
+    default:
+      break;
+    }
+    return;
+  }
+
+  // WLAN-Kategorie: dynamische Liste bekannter Netze bzw. Profil-Detailansicht.
+  if (s_cat == CAT_WIFI) {
+    if (inWifiList()) {
+      int n = wifiListRows();
+      switch (k) {
+      case 'w':
+      case 'W':
+      case 'i':
+      case 'I':
+        s_sel = (s_sel + n - 1) % n;
+        markDirty();
+        break;
+      case 's':
+      case 'S':
+      case 'k':
+      case 'K':
+        s_sel = (s_sel + 1) % n;
+        markDirty();
+        break;
+      case '\r':
+      case 'd':
+      case 'D':
+      case 'l':
+      case 'L':
+        if (wifiIsNewRow(s_sel)) { // „+ Neues WLAN" → SSID direkt eingeben
+          s_wifiAdding = true;
+          s_wifiIdx = settings::wifiCount();
+          s_sel = 0;
+          startEdit(ROW_WSSID);
+        } else {
+          s_wifiIdx = s_sel;
+          s_sel = 0;
+          markDirty();
+        } // Profil öffnen
+        break;
+      case '\b':
+      case 'q':
+      case 'Q':
+        s_sel = s_cat;
+        s_cat = -1;
+        markDirty();
+        break;
+      default:
+        break;
+      }
+      return;
+    }
+    // Detailansicht: SSID / Passwort / Löschen.
+    int n = kCats[CAT_WIFI].count;
+    int row = kCats[CAT_WIFI].rows[s_sel];
+    switch (k) {
+    case 'w':
+    case 'W':
+    case 'i':
+    case 'I':
+      s_sel = (s_sel + n - 1) % n;
+      markDirty();
+      break;
+    case 's':
+    case 'S':
+    case 'k':
+    case 'K':
+      s_sel = (s_sel + 1) % n;
+      markDirty();
+      break;
+    case '\r':
+    case 'd':
+    case 'D':
+    case 'l':
+    case 'L':
+      if (rowEditable(row))
+        startEdit(row);
+      else if (row == ROW_WDEL) {
+        settings::wifiRemove(s_wifiIdx);
+        s_wifiIdx = -1;
+        s_sel = 0;
+        markDirty();
+      }
+      break;
+    case '\b':
+    case 'q':
+    case 'Q':
+      s_wifiIdx = -1;
+      s_sel = 0;
+      markDirty();
+      break; // zurück zur Liste
+    default:
+      break;
+    }
+    return;
+  }
+
+  // Innerhalb einer Kategorie.
+  int n = kCats[s_cat].count;
+  int row = kCats[s_cat].rows[s_sel];
+  switch (k) {
+  case 'w':
+  case 'W':
+  case 'i':
+  case 'I':
+    s_sel = (s_sel + n - 1) % n;
+    markDirty();
+    break;
+  case 's':
+  case 'S':
+  case 'k':
+  case 'K':
+    s_sel = (s_sel + 1) % n;
+    markDirty();
+    break;
+  case 'a':
+  case 'A':
+  case 'j':
+  case 'J':
+    changeRow(row, -1);
+    break;
+  case 'd':
+  case 'D':
+  case 'l':
+  case 'L':
+    changeRow(row, +1);
+    break;
+  case '\r':
+    if (rowEditable(row))
+      startEdit(row);
+    else if (row == ROW_OTAGO)
+      runOtaAction();
+    else if (row == ROW_SDREMOUNT) {
+      spiLock();
+      SD.end();
+      spiUnlock();
+      board::initSD();
+      refreshSdInfo();
+      markDirty();
+    } else if (row == ROW_SDFORMAT) {
+      if (!s_sdFormatReady) {
+        s_sdFormatReady = true;
+        markDirty();
+      } else {
+        // Second press: format the card (FAT32).
+        s_sdFormatReady = false;
+        if (board::sdReady()) {
+          spiLock();
+          SD.end();
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+          SD.format();
+#endif
+          spiUnlock();
+          board::initSD();
+        }
+        refreshSdInfo();
+        markDirty();
+      }
+    } else
+      changeRow(row, +1);
+    break;
+  case '\b':
+  case 'q':
+  case 'Q': // zurück zur Kategorie-Liste
+    s_sdFormatReady = false;
+    s_sel = s_cat;
+    s_cat = -1;
+    markDirty();
+    break;
+  default:
+    break;
+  }
+}
+
+// Touch in der WLAN-Kategorie (dynamische Liste bzw. Profil-Detail).
+void onTouchWifi(int x, int y) {
+  (void)x;
+  // Kopfzeile: eine Ebene zurück (Detail → Liste, Liste → Kategorie-Liste).
+  if (y >= VP_TOP && y < VP_TOP + SEC_H) {
+    if (inWifiDetail()) {
+      s_wifiIdx = -1;
+      s_sel = 0;
+    } else {
+      s_sel = s_cat;
+      s_cat = -1;
+    }
+    markDirty();
+    return;
+  }
+  int rows = inWifiList() ? wifiListRows() : kCats[CAT_WIFI].count;
+  int sidx = -1, yy = VP_TOP + SEC_H;
+  for (int i = 0; i < rows; i++) {
+    if (y >= yy && y < yy + ROW_H) {
+      sidx = i;
+      break;
+    }
+    yy += ROW_H;
+  }
+  if (sidx < 0)
+    return;
+  if (sidx != s_sel) {
+    s_sel = sidx;
+    markDirty();
+    return;
+  } // erster Tap wählt nur
+
+  if (inWifiList()) {
+    if (wifiIsNewRow(sidx)) {
+      s_wifiAdding = true;
+      s_wifiIdx = settings::wifiCount();
+      s_sel = 0;
+      startEdit(ROW_WSSID);
+    } else {
+      s_wifiIdx = sidx;
+      s_sel = 0;
+      markDirty();
+    }
+    return;
+  }
+  int row = kCats[CAT_WIFI].rows[sidx];
+  if (rowEditable(row)) {
+    startEdit(row);
+    return;
+  }
+  if (row == ROW_WDEL) {
+    settings::wifiRemove(s_wifiIdx);
+    s_wifiIdx = -1;
+    s_sel = 0;
+    markDirty();
+  }
+}
+
+void onTouch(int x, int y) {
+  // Unterer Eckknopf = „Zurück" (genau eine Ebene): Bearbeitung verlassen →
+  // Kategorie-Liste → Launcher. Home global über die Statuszeile.
+  if (kHome.hit(x, y)) {
+    if (s_edit >= 0) {
+      finishEdit(true);
+      return;
+    }
+    if (inWifiDetail()) {
+      s_wifiIdx = -1;
+      s_sel = 0;
+      markDirty();
+      return;
+    } // Detail → Liste
+    if (s_cat >= 0) {
+      s_sel = s_cat;
+      s_cat = -1;
+      markDirty();
+      return;
+    }
+    appmgr::goHome();
+    return;
+  }
+
+  // Wurzelebene: Tap auf eine Kategorie öffnet sie.
+  if (s_cat < 0) {
+    int c = hitCat(y);
+    if (c >= 0) {
+      s_cat = c;
+      s_sel = 0;
+      s_wifiIdx = -1;
+      s_wifiAdding = false;
+      if (c == CAT_SD)
+        refreshSdInfo(); // cache before first draw
+      markDirty();
+    }
+    return;
+  }
+
+  if (s_cat == CAT_WIFI) {
+    onTouchWifi(x, y);
+    return;
+  }
+
+  // Tap auf die Kopfzeile geht zurück zur Kategorie-Liste.
+  if (y >= VP_TOP && y < VP_TOP + SEC_H) {
+    s_sel = s_cat;
+    s_cat = -1;
+    markDirty();
+    return;
+  }
+
+  int sidx = hitRow(y);
+  if (sidx < 0)
+    return;
+  int row = kCats[s_cat].rows[sidx];
+  // Erster Tap wählt nur aus; Tap auf die ausgewählte Zeile ändert/öffnet.
+  if (sidx != s_sel) {
+    s_sel = sidx;
+    markDirty();
+    return;
+  }
+  if (rowEditable(row)) {
+    startEdit(row);
+    return;
+  }
+  if (row == ROW_OTAGO) {
+    runOtaAction();
+    return;
+  }
+  if (row == ROW_SDREMOUNT) {
+    spiLock();
+    SD.end();
+    spiUnlock();
+    board::initSD();
+    refreshSdInfo();
+    markDirty();
+    return;
+  }
+  if (row == ROW_SDFORMAT) {
+    if (!s_sdFormatReady) {
+      s_sdFormatReady = true;
+      markDirty();
+    } else {
+      s_sdFormatReady = false;
+      if (board::sdReady()) {
+        spiLock();
+        SD.end();
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+        SD.format();
+#endif
+        spiUnlock();
+        board::initSD();
+      }
+      refreshSdInfo();
+      markDirty();
+    }
+    return;
+  }
+  // Info-only rows (SD status/type/space): tap does nothing meaningful.
+  if (row == ROW_SDSTATUS || row == ROW_SDTYPE || row == ROW_SDTOTAL ||
+      row == ROW_SDUSED || row == ROW_SDFREE)
+    return;
+  changeRow(row, (x >= W / 2) ? +1 : -1);
+}
+
+class SettingsApp : public App {
+public:
+  const char *id() const override { return "Settings"; }
+  const char *name() const override { return i18n::tr(i18n::Str::AppSettings); }
+
+  void onEnter() override {
+    s_cat = -1;
+    s_sel = 0;
+    s_edit = -1;
+    s_wifiIdx = -1;
+    s_wifiAdding = false;
+    s_otaReady = false;
+    s_otaStatus[0] = '\0';   // OTA-Zustand pro Sitzung frisch
+    s_sdFormatReady = false; // Format-Bestätigung zurücksetzen
+  }
+
+  void onLeave() override {
+    if (s_edit >= 0)
+      finishEdit(true);
+  }
+
+  void handleInput(const InputEvent &e) override {
+    if (e.type == InputEvent::TAP)
+      onTouch(e.x, e.y);
+    else
+      onKey(e.key);
+  }
+
+  void draw(Adafruit_GFX &g) override {
+    using i18n::Str;
+    g.setTextColor(GxEPD_BLACK);
+
+    if (s_cat < 0) {
+      // Wurzel: Kategorie-Liste.
+      int y = VP_TOP;
+      for (int i = 0; i < CAT_COUNT; i++) {
+        drawCatRow(g, i, y);
+        y += ROW_H;
+      }
+    } else if (inWifiList()) {
+      // WLAN-Kategorie: dynamische Liste bekannter Netze + „Neu".
+      g.setTextSize(1);
+      g.setCursor(8, VP_TOP + 3);
+      gui::print(g, "\x11 WLAN (All known networks)"); // 0x11 = ◄
+      g.drawFastHLine(0, VP_TOP + SEC_H - 1, W, GxEPD_BLACK);
+      int y = VP_TOP + SEC_H;
+      for (int i = 0; i < wifiListRows(); i++) {
+        drawWifiListRow(g, i, y);
+        y += ROW_H;
+      }
+    } else {
+      // Kategorie- bzw. WLAN-Profil-Detailzeilen. Kopfzeile mit Zurück-Hinweis
+      // (◄).
+      g.setTextSize(1);
+      char hdr[40];
+      if (s_cat == CAT_WIFI) {
+        char ssid[33];
+        settings::wifiSsidAt(s_wifiIdx, ssid, sizeof(ssid));
+        snprintf(hdr, sizeof(hdr), "\x11 WLAN: %s",
+                 s_wifiAdding || !ssid[0] ? "neu" : ssid);
+      } else {
+        snprintf(hdr, sizeof(hdr), "\x11 %s", catName(s_cat));
+      }
+      g.setCursor(8, VP_TOP + 3);
+      gui::print(g, hdr);
+      g.drawFastHLine(0, VP_TOP + SEC_H - 1, W, GxEPD_BLACK);
+      int y = VP_TOP + SEC_H;
+      for (int i = 0; i < kCats[s_cat].count; i++) {
+        drawRow(g, kCats[s_cat].rows[i], y, i == s_sel);
+        y += ROW_H;
+      }
+    }
+
+    gui::drawButton(g, kHome, i18n::tr(Str::BtnBack), false);
+    g.setTextSize(1);
+    g.setCursor(FOOT_X, 278);
+    if (s_edit >= 0)
+      gui::print(g, i18n::tr(Str::HintEnterSave));
+    else if (s_cat < 0)
+      gui::print(g, "Open Source (FOSS)");
+    else if (inWifiList())
+      gui::print(g, wifiIsNewRow(s_sel) ? "Press Enter to connect to Wi-Fi"
+                                        : "Press Enter to open");
+    else if (curRow() == ROW_WDEL)
+      gui::print(g, "Enter deletes");
+    else if (curRow() == ROW_OTAGO)
+      gui::print(g, s_otaReady ? "Enter installed" : "Enter checking");
+    else if (curRow() == ROW_SDREMOUNT)
+      gui::print(g, "Enter remounts SD card");
+    else if (curRow() == ROW_SDFORMAT)
+      gui::print(g, s_sdFormatReady ? "Enter confirms format!"
+                                    : "Enter to format SD");
+    else if (curRow() == ROW_SDSTATUS || curRow() == ROW_SDTYPE ||
+             curRow() == ROW_SDTOTAL || curRow() == ROW_SDUSED ||
+             curRow() == ROW_SDFREE)
+      gui::print(g, "SD card info");
+    else if (curRow() == ROW_NAME)
+      gui::print(g, i18n::tr(Str::HintNameEdit));
+    else if (rowEditable(curRow()))
+      gui::print(g, i18n::tr(Str::HintEdit));
+    else
+      gui::print(g, i18n::tr(Str::HintChange));
+    char info[32];
+    snprintf(info, sizeof(info), i18n::tr(Str::FmtBattery), battery::percent(),
+             battery::charging() ? "+" : "", battery::milliVolts());
+    g.setCursor(FOOT_X, 290);
+    gui::print(g, info);
+    g.setCursor(FOOT_X, 302);
+    gui::print(g, "Jarvis " FENNEK_VERSION);
+    g.setCursor(FOOT_X, 314);
+    gui::print(g, "");
+  }
+};
+
+SettingsApp s_app;
+
+} // namespace
+
+namespace settings_app {
+
+App *get() { return &s_app; }
+
+} // namespace settings_app

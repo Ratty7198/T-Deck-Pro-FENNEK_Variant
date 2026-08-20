@@ -1,0 +1,407 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dr. Daniel Dumke
+
+#include "appmgr.h"
+#include "config.h"
+#include "core/battery.h"
+#include "core/display.h"
+#include "core/gui.h"
+#include "core/i18n.h"
+#include "core/keyboard.h"
+#include "core/power.h"
+#include "core/settings.h"
+#include "core/touch.h"
+#include "services/audio.h"
+#include "services/battlog.h"
+#include "services/library.h"
+#include "services/timesync.h"
+
+#include <Arduino.h>
+#include <GxEPD2_BW.h>   // GxEPD_BLACK / GxEPD_WHITE
+#include <string.h>
+#include <time.h>
+
+namespace {
+
+constexpr int kMaxApps = 10;
+
+App*     s_apps[kMaxApps];
+int      s_count = 0;
+App*     s_cur   = nullptr;
+
+bool     s_dirty       = true;
+uint32_t s_settleUntil = 0;    // Anti-Doppeltap nach langem Refresh
+
+// Statuszeilen-Zustand (für Region-Refresh nur bei Änderung).
+uint8_t  s_lastAudioGlyph = 0; // 0=aus, 1=spielt, 2=pausiert
+uint8_t  s_lastClockMin   = 0xFF; // zuletzt gezeichnete Uhr-Minute (0xFF = ungültig/keine)
+uint8_t  s_battPct        = 0;
+bool     s_battChg        = false;
+uint32_t s_lastStatusPoll = 0;
+uint32_t s_lastBattPoll   = 0;
+uint32_t s_lastPersist    = 0;
+
+uint8_t audioGlyph() {
+  audio::Status st = audio::status();
+  if (!st.playing) return 0;
+  return st.paused ? 2 : 1;
+}
+
+// Aktuelle Lokal-Minute (0..59) für den Statuszeilen-Takt; 0xFF wenn Uhr ungültig.
+uint8_t clockMinute() {
+  time_t tt = (time_t)timesync::now();
+  struct tm lt;
+  localtime_r(&tt, &lt);
+  if (lt.tm_year + 1900 < 2025) return 0xFF;
+  return (uint8_t)lt.tm_min;
+}
+
+// Kleines Schloss-Symbol (Tastensperre) in der Statuszeile.
+void drawLock(Adafruit_GFX& g, int x, int y) {
+  g.drawCircle(x + 5, y + 4, 4, GxEPD_BLACK);   // Bügel
+  g.drawCircle(x + 5, y + 4, 3, GxEPD_BLACK);
+  g.fillRoundRect(x, y + 4, 11, 9, 2, GxEPD_BLACK);  // Körper
+  g.fillCircle(x + 5, y + 8, 1, GxEPD_WHITE);    // Schlüsselloch
+}
+
+// ---- Sperrbildschirm (Vollbild) --------------------------------------------
+// Beim Kurzdruck auf den oberen Knopf zeigt der appmgr statt der App einen
+// eigenen Sperrbildschirm: große EXAKTE Uhr (das Gerät läuft, minütlich per
+// Region-Refresh nachgezogen), Datum + Akku, ggf. Now-Playing und ein
+// Entsperr-Hinweis. Gegenstück zum groben Standby-Screen in core/power.cpp.
+constexpr int LOCK_BAND_Y = 70;    // Info-Band (Uhr/Datum/Akku/Now-Playing)
+constexpr int LOCK_BAND_H = 150;   // minütlich per renderRegion aktualisiert
+
+// Text der Größe `size` horizontal zentriert bei y ausgeben.
+void drawCentered(Adafruit_GFX& g, int y, const char* utf8, uint8_t size) {
+  g.setTextSize(size);
+  uint16_t w, h;
+  gui::textBounds(g, utf8, &w, &h);
+  gui::printAt(g, (EINK_W - (int)w) / 2, y, utf8, size);
+}
+
+// Now-Playing-Kurzname: Dateiname des laufenden Tracks ohne Pfad/Endung;
+// leer, wenn nichts spielt.
+void currentTrackLabel(char* out, size_t n) {
+  out[0] = '\0';
+  audio::Status st = audio::status();
+  if (!st.playing) return;
+  char p[TRACK_PATH_LEN];
+  audio::currentPath(p, sizeof(p));
+  if (!p[0]) return;
+  const char* base = strrchr(p, '/');
+  base = base ? base + 1 : p;
+  strncpy(out, base, n - 1);
+  out[n - 1] = '\0';
+  char* dot = strrchr(out, '.');
+  if (dot && dot != out) *dot = '\0';
+}
+
+// Größeres Schloss-Symbol, Bügelmitte bei (cx, cy).
+void drawBigLock(Adafruit_GFX& g, int cx, int cy) {
+  for (int r = 7; r <= 8; r++)
+    g.drawCircleHelper(cx, cy, r, 0x1 | 0x2, GxEPD_BLACK);  // Bügel (obere Hälfte)
+  g.fillRoundRect(cx - 12, cy, 24, 18, 3, GxEPD_BLACK);     // Körper
+  g.fillCircle(cx, cy + 8, 2, GxEPD_WHITE);                 // Schlüsselloch
+  g.fillRect(cx - 1, cy + 8, 2, 5, GxEPD_WHITE);
+}
+
+// Info-Band: Uhr + Datum + Akku + Now-Playing. Eigenständig, damit die Uhr
+// minütlich als Region-Refresh (ohne Vollflackern) nachgezogen werden kann.
+void drawLockBand(Adafruit_GFX& g) {
+  g.fillRect(0, LOCK_BAND_Y, EINK_W, LOCK_BAND_H, GxEPD_WHITE);
+  g.setTextColor(GxEPD_BLACK);
+
+  time_t tt = (time_t)timesync::now();
+  struct tm lt;
+  localtime_r(&tt, &lt);
+  bool haveClock = (lt.tm_year + 1900 >= 2025);
+
+  char clk[6];
+  if (haveClock) snprintf(clk, sizeof(clk), "%02d:%02d", lt.tm_hour, lt.tm_min);
+  else           snprintf(clk, sizeof(clk), "--:--");
+  drawCentered(g, LOCK_BAND_Y + 4, clk, 6);   // große exakte Uhr
+
+  static const char* kWd[7] = {"So", "Mo", "Tu", "We", "Th", "Fr", "Sa"};
+  char info[40];
+  if (haveClock)
+    snprintf(info, sizeof(info), "%s %02d.%02d.  %d%%%s",
+             kWd[lt.tm_wday % 7], lt.tm_mday, lt.tm_mon + 1,
+             s_battPct, s_battChg ? "+" : "");
+  else
+    snprintf(info, sizeof(info), "%d%%%s", s_battPct, s_battChg ? "+" : "");
+  drawCentered(g, LOCK_BAND_Y + 78, info, 2);
+
+  char trk[48];
+  currentTrackLabel(trk, sizeof(trk));
+  if (trk[0]) {
+    char np[52];
+    snprintf(np, sizeof(np), "\x0E %s", trk);   // CP437 0x0E = Doppelnote
+    drawCentered(g, LOCK_BAND_Y + 112, np, 2);
+  }
+}
+
+void drawLockScreen(Adafruit_GFX& g) {
+  g.fillScreen(GxEPD_WHITE);
+  g.setTextColor(GxEPD_BLACK);
+  drawCentered(g, 34, i18n::tr(i18n::Str::StatusLocked), 2);   // Kopf: „Gesperrt"
+  drawLockBand(g);
+  g.drawFastHLine(24, 234, EINK_W - 48, GxEPD_BLACK);          // Fuß-Trennlinie
+  drawBigLock(g, EINK_W / 2, 252);
+  drawCentered(g, 288, i18n::tr(i18n::Str::LockUnlockHint), 1);
+}
+
+void drawStatusBar(Adafruit_GFX& g) {
+  g.fillRect(0, 0, EINK_W, appmgr::STATUS_H, GxEPD_WHITE);
+  g.setTextColor(GxEPD_BLACK);
+  g.setTextSize(1);
+  // Außerhalb des Launchers ein Haus-Glyph (CP437 0x7F = ⌂) als sichtbarer
+  // Home-Hinweis; die ganze Statuszeile ist tap-bar (s. handleTouch → goHome).
+  bool homeHint = (s_cur && s_count > 0 && s_cur != s_apps[0]);
+  if (homeHint) {
+    g.setCursor(6, 7);
+    g.write((uint8_t)0x7F);
+    g.setCursor(20, 7);
+  } else {
+    g.setCursor(6, 7);
+  }
+  gui::print(g, s_cur ? s_cur->name() : "");
+
+  // Tastensperre: Schloss + "Gesperrt" (mittig, vor Audio/Akku).
+  if (power::locked()) {
+    drawLock(g, 92, 4);
+    g.setCursor(108, 7);
+    gui::print(g, i18n::tr(i18n::Str::StatusLocked));
+  }
+
+  // Uhr (HH:MM) mittig — entfällt bei Tastensperre (da steht dort "Gesperrt").
+  if (!power::locked()) {
+    char clk[6];
+    time_t tt = (time_t)timesync::now();
+    struct tm lt;
+    localtime_r(&tt, &lt);
+    if (lt.tm_year + 1900 >= 2025)
+      snprintf(clk, sizeof(clk), "%02d:%02d", lt.tm_hour, lt.tm_min);
+    else
+      snprintf(clk, sizeof(clk), "--:--");   // Uhr noch nie gesetzt
+    g.setCursor(105, 7);   // mittig: (240-30)/2
+    g.print(clk);
+  }
+
+  // Audio-Indikator Mitte/rechts: CP437 0x0E = Doppelnote.
+  uint8_t a = audioGlyph();
+  if (a) {
+    g.setCursor(EINK_W - 80, 7);
+    g.write((uint8_t)0x0E);
+    g.print(a == 1 ? " \x10" : " ||");   // ▶ bzw. Pause
+  }
+
+  // Akku rechts: "87%" bzw. "87%+" beim Laden.
+  if (s_battPct > 0) {
+    char b[8];
+    snprintf(b, sizeof(b), "%d%%%s", s_battPct, s_battChg ? "+" : "");
+    g.setCursor(EINK_W - 36, 7);
+    g.print(b);
+  }
+  g.drawFastHLine(0, appmgr::STATUS_H - 1, EINK_W, GxEPD_BLACK);
+}
+
+void drawComposite(Adafruit_GFX& g) {
+  if (power::locked()) { drawLockScreen(g); return; }
+  drawStatusBar(g);
+  if (s_cur) s_cur->draw(g);
+}
+
+// Zuletzt gespielten Musik-Track regelmäßig sichern (Resume nach Reboot).
+// Hörbuch-Bookmarks verwaltet die Hörbuch-App selbst.
+void persistPlayback() {
+  audio::Status st = audio::status();
+  settings::setVolume(st.volume);
+  if (st.playing && st.owner == audio::Owner::Music) {
+    char p[TRACK_PATH_LEN];
+    audio::currentPath(p, sizeof(p));
+    if (p[0]) settings::setLastTrack(p, st.posSec);
+  }
+}
+
+}  // namespace
+
+namespace appmgr {
+
+void add(App* a) {
+  if (s_count < kMaxApps) s_apps[s_count++] = a;
+}
+
+void begin() {
+  power::begin();
+  s_cur = (s_count > 0) ? s_apps[0] : nullptr;
+  if (s_cur) s_cur->onEnter();
+
+  // Zuletzt aktive App wiederherstellen.
+  char last[24];
+  settings::lastApp(last, sizeof(last));
+  if (last[0]) {
+    for (int i = 1; i < s_count; i++) {
+      if (strcmp(s_apps[i]->id(), last) == 0) { launch(s_apps[i]); break; }
+    }
+  }
+  s_dirty = true;
+}
+
+void launch(App* a) {
+  if (!a || a == s_cur) return;
+  if (s_cur) s_cur->onLeave();
+  s_cur = a;
+  s_cur->onEnter();
+  settings::setLastApp(a->id());
+  BATTLOG_EVENT("App", "%s", a->id());   // Debug-Akku-Logger (no-op ohne BATTLOG)
+  s_dirty = true;
+}
+
+void goHome() {
+  if (s_count > 0) launch(s_apps[0]);
+}
+
+App* current() { return s_cur; }
+
+void markDirty() { s_dirty = true; }
+bool isDirty()   { return s_dirty; }
+
+void loop() {
+  // 1) Eingaben: Touch + Tastatur. Bei Tastensperre werden Events zwar
+  //    abgeholt (Puffer leeren), aber nicht an die App weitergereicht.
+  const bool locked = power::locked();
+  int16_t tx, ty;
+  if (touch::poll(tx, ty) && !locked && millis() >= s_settleUntil) {
+    power::noteActivity();
+    // Tap-Log gedrosselt (≥400 ms): ein gehaltener Finger meldet Dauer-Taps
+    // (bekannt kosmetisch) und flutete sonst die Serial-Konsole bei jedem
+    // Loop-Durchlauf. Die Tap-Verarbeitung selbst bleibt unberührt.
+    static uint32_t s_lastTapLog = 0;
+    if (millis() - s_lastTapLog >= 400) {
+      s_lastTapLog = millis();
+      Serial.printf("[APP] Tap @ %d,%d (%s)\n", tx, ty, s_cur ? s_cur->id() : "-");
+    }
+    if (ty < STATUS_H) {
+      if (s_cur != s_apps[0]) goHome();
+    } else if (s_cur) {
+      InputEvent e;
+      e.type = InputEvent::TAP;
+      e.x = tx; e.y = ty; e.key = 0;
+      s_cur->handleInput(e);
+    }
+  }
+  // Gepufferte Tastendrücke in EINEM Durchlauf abarbeiten und erst danach
+  // (Schritt 6 bzw. App-tick()) neu zeichnen. Sonst verarbeitet die Loop nur
+  // eine Taste pro Iteration und jeder Tastendruck kostet einen eigenen
+  // ~650-ms-Refresh — spürbar zähes Tippen/Löschen z. B. in der Notizen-App.
+  if (!locked && s_cur) {
+    for (int n = 0; n < 16; n++) {
+      char k = keyboard::poll();
+      if (!k) break;
+      power::noteActivity();
+      InputEvent e;
+      e.type = InputEvent::KEY;
+      e.x = e.y = 0; e.key = k;
+      s_cur->handleInput(e);
+    }
+  }
+
+  // 1b) Ausschaltknopf (Langdruck = Standby) + Auto-Standby nach Inaktivität.
+  //     Sicherer Punkt: noch kein E-Ink-Refresh angestoßen.
+  power::poll();
+
+  // 2) Hintergrund-Arbeit aller Apps (Mesh-Loop, Bookmark-Writes, ...).
+  for (int i = 0; i < s_count; i++) s_apps[i]->background();
+
+  // 2b) Bibliotheks-Scan und ID3-Tag-Scan häppchenweise (UI bleibt bedienbar).
+  //     Beide pausieren bei laufender Wiedergabe: jeder Schritt belegt unter
+  //     spiLock die SD und würde dem Audio-Task den Bus streitig machen.
+  static bool s_wasTagging  = false;
+  static bool s_wasScanning = false;
+  audio::Status ast = audio::status();
+  const bool audioActive = ast.playing && !ast.paused;
+  if (library::scanning()) {
+    if (!audioActive) library::scanStep(6);
+    s_wasScanning = true;
+  } else {
+    if (s_wasScanning) {
+      s_wasScanning = false;
+      s_dirty = true;   // Listen/Launcher zeigen die frische Bibliothek
+    }
+    if (library::tagScanPending()) {
+      if (!audioActive) {
+        library::tagScanStep(2);
+        s_wasTagging = true;
+      }
+    } else if (s_wasTagging) {
+      s_wasTagging = false;
+      int d, t; library::tagScanProgress(&d, &t);
+      Serial.printf("[APP] ID3-Scan fertig (%d/%d) — Indizes neu sortiert\n", d, t);
+      s_dirty = true;   // Listen zeigen jetzt Tag-Daten
+    }
+  }
+
+  // 3) Vordergrund-Tick (kann markDirty() setzen oder Region-Refreshes machen).
+  //    Bei Tastensperre ausgesetzt — sonst würde App-Inhalt über den
+  //    Sperrbildschirm gezeichnet.
+  if (!locked && s_cur) s_cur->tick();
+
+  uint32_t now = millis();
+
+  // 4) Akku alle 30 s lesen; Wiedergabe-Zustand alle 30 s persistieren.
+  if (now - s_lastBattPoll >= 30000 || s_lastBattPoll == 0) {
+    s_lastBattPoll = now;
+    s_battPct = battery::percent();
+    s_battChg = battery::charging();
+  }
+  if (now - s_lastPersist >= 30000) {
+    s_lastPersist = now;
+    persistPlayback();
+  }
+
+  // 5) Statuszeile aktuell halten (nur Region-Refresh bei Änderung).
+  if (!locked && !s_dirty && now - s_lastStatusPoll >= 1000) {
+    s_lastStatusPoll = now;
+    uint8_t a  = audioGlyph();
+    uint8_t mn = clockMinute();
+    if (a != s_lastAudioGlyph || mn != s_lastClockMin) {
+      s_lastAudioGlyph = a;
+      s_lastClockMin = mn;
+      display::renderRegion(drawStatusBar, 0, STATUS_H);
+    }
+  }
+
+  // 5b) Sperrzustand-Wechsel → kompletter Neuaufbau: rein zum Sperrbildschirm,
+  //     raus zurück zur App (drawComposite verzweigt auf power::locked()).
+  static int s_lockShown = -1;
+  int lk = locked ? 1 : 0;
+  if (lk != s_lockShown) {
+    s_lockShown = lk;
+    s_dirty = true;
+  }
+
+  // 5c) Gesperrt: exakte Uhr minütlich im Info-Band nachziehen — Region-Refresh
+  //     statt Vollflackern. (Voll-Redraw in Schritt 6 setzt s_lastClockMin.)
+  if (locked && !s_dirty) {
+    uint8_t mn = clockMinute();
+    if (mn != s_lastClockMin) {
+      s_lastClockMin = mn;
+      display::renderRegion(drawLockBand, LOCK_BAND_Y, LOCK_BAND_H);
+    }
+  }
+
+  // 6) Koaleszierter Voll-Redraw.
+  if (s_dirty) {
+    s_dirty = false;
+    s_lastAudioGlyph = audioGlyph();
+    s_lastClockMin = clockMinute();
+    display::render(drawComposite, false);
+    // Der Render blockierte ~650 ms; aufgelaufene Taps verwerfen und kurz
+    // nachsperren, damit ein Tap nicht doppelt zählt (aus altem ui.cpp).
+    touch::flush();
+    s_settleUntil = millis() + 250;
+  }
+}
+
+}  // namespace appmgr
